@@ -296,9 +296,14 @@ class ValueFunctionBaseline(BaselineStrategy):
         self.epsilon = epsilon
         
         # Optional normalizers
-        self.rewards_normalizer = (
-            RunningStandardization(agent) if normalize_returns else PolicyGradientUtils.compute_discounted_returns
-        )
+        if normalize_returns:
+            self.rewards_normalizer = RunningStandardization(agent)
+        else:
+            # Wrap compute_discounted_returns so gamma is correctly supplied
+            def _returns_fn(ep_data: EpisodeData):
+                return PolicyGradientUtils.compute_discounted_returns(ep_data, agent.gamma)
+
+            self.rewards_normalizer = _returns_fn
         self.advantages_normalizer = (
             RunningAdvantageStandardization(epsilon=epsilon) if normalize_advantages else None
         )
