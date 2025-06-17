@@ -39,15 +39,15 @@ class PolicyGradientUtils:
     """Utility functions for policy gradient algorithms."""
     
     @staticmethod
-    def compute_discounted_returns(rewards, gamma =None):
+    def compute_discounted_returns(rewards, gamma=None):
         if isinstance(rewards, EpisodeData):
             rewards = rewards.get_rewards(return_pt=True)
+        rewards = rewards.to(torch.float64)
         T = rewards.size(0)
-        gamma_powers = gamma ** torch.arange(T, dtype=rewards.dtype, device=rewards.device)
-        discounted   = rewards * gamma_powers                
-        returns      = torch.flip(torch.cumsum(torch.flip(discounted, [0]), 0), [0])
-        returns     /= gamma_powers                           
-        return returns    
+        gamma_powers = gamma ** torch.arange(T, dtype=torch.float64, device=rewards.device)
+        discounted = rewards * gamma_powers
+        returns = torch.flip(torch.cumsum(torch.flip(discounted, [0]), 0), [0])
+        return returns.float()
    
     class DebugTimer:
         """Utility class for accurate timing measurements during training."""
@@ -154,7 +154,15 @@ class BaselineStrategy:
         self.agent = agent
         self.device = agent.device
 
-
+    def load_state_dict(self, state_dict):
+        """Load the state dictionary into the baseline strategy."""
+        if hasattr(self, 'value_network'):
+            self.value_network.load_state_dict(state_dict)
+        else:
+            raise NotImplementedError("This baseline strategy does not support loading state dicts.")
+    def train_step(self, episode_data: EpisodeData):
+        """Perform a training step for the baseline strategy."""
+        pass
 class NoBaseline(BaselineStrategy):
     """No baseline - returns raw discounted returns."""
     
@@ -165,8 +173,8 @@ class NoBaseline(BaselineStrategy):
 
 class EpisodicStandardization(BaselineStrategy):
     """Standardize rewards within each episode."""
-    
-    def __call__(self, episode_data: EpisodeData) -> torch.Tensor:
+
+    def __call__(self, episode_data: EpisodeData, train: bool = True) -> torch.Tensor:
         rewards = episode_data.get_rewards(return_pt=True).to(self.device)
         
         # Standardize rewards
@@ -188,7 +196,7 @@ class RunningStandardization(BaselineStrategy):
         self.running_std = 1.0
         self.momentum = momentum
     
-    def __call__(self, episode_data: EpisodeData) -> torch.Tensor:
+    def __call__(self, episode_data: EpisodeData, train: bool = True) -> torch.Tensor:
         rewards = episode_data.get_rewards(return_pt=True).to(self.device)
         returns = PolicyGradientUtils.compute_discounted_returns(rewards, self.agent.gamma)
         
@@ -203,17 +211,34 @@ class RunningStandardization(BaselineStrategy):
         standardized_returns = (returns - self.running_mean) / (self.running_std + 1e-8)
         return standardized_returns
 
+class RunningCentering(BaselineStrategy):
+    """Center returns using running statistics."""
+    def __init__(self, agent, momentum: float = 0.01, epsilon: float = 1e-8):
+        super().__init__(agent)
+        self.running_mean = 0.0
+        self.momentum = momentum
+        self.epsilon = epsilon
 
-class RunningAdvantageStandardization:
+    def __call__(self, episode_data: EpisodeData, train: bool = True) -> torch.Tensor:
+        values = episode_data.get_rewards(return_pt=True).to(self.device) 
+        episode_mean = values.mean().item()
+        
+        # Update running mean
+        self.running_mean += self.momentum * (episode_mean - self.running_mean)
+        
+        # Center values
+        return values - self.running_mean + self.epsilon
+
+class RunningAdvantageStandardization(BaselineStrategy):
     """Standardize advantages using running statistics."""
-    
+
     def __init__(self, momentum: float = 0.01, epsilon: float = 1e-8):
         self.running_mean = 0.0
         self.running_std = 1.0
         self.momentum = momentum
         self.epsilon = epsilon
     
-    def __call__(self, advantages: torch.Tensor) -> torch.Tensor:
+    def __call__(self, advantages: torch.Tensor, train: bool = True) -> torch.Tensor:
         episode_mean = advantages.mean().item()
         episode_std = advantages.std().item()
         
@@ -222,7 +247,23 @@ class RunningAdvantageStandardization:
         
         return (advantages - self.running_mean) / (self.running_std + self.epsilon)
 
+class RunningAdvantageCentering:
+    """Center advantages using running statistics."""
+    
+    def __init__(self, momentum: float = 0.01, epsilon: float = 1e-8):
+        self.running_mean = 0.0
+        self.momentum = momentum
+        self.epsilon = epsilon
 
+    def __call__(self, advantages: torch.Tensor, train: bool = True) -> torch.Tensor:
+        episode_mean = advantages.mean().item()
+        
+        # Update running mean
+        self.running_mean += self.momentum * (episode_mean - self.running_mean)
+        
+        # Center advantages
+        return advantages - self.running_mean + self.epsilon
+    
 class ValueFunctionBaseline(BaselineStrategy):
     """Neural network value function baseline with advantage estimation."""
     
@@ -290,14 +331,17 @@ class ValueFunctionBaseline(BaselineStrategy):
         self.value_network = nn.Sequential(*layers).to(self.device)
 
         # Initialize weights orthogonally
-        self._init_weights(init_gain)
-        
-        self.optimizer = torch.optim.AdamW(self.value_network.parameters(), lr=learning_rate, weight_decay=1e-5)        
+        self._init_weights(init_gain)        
+        self.optimizer = torch.optim.Adam(self.value_network.parameters(), lr=learning_rate)        
         self.epsilon = epsilon
         
         # Optional normalizers
         self.rewards_normalizer = (
-            RunningStandardization(agent) if normalize_returns else PolicyGradientUtils.compute_discounted_returns
+            RunningStandardization(agent) if normalize_returns else 
+            lambda episode_data: PolicyGradientUtils.compute_discounted_returns(
+                episode_data.get_rewards(return_pt=True).to(self.device), 
+                agent.gamma
+            )
         )
         self.advantages_normalizer = (
             RunningAdvantageStandardization(epsilon=epsilon) if normalize_advantages else None

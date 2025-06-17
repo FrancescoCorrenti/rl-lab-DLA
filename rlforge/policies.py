@@ -22,7 +22,7 @@ class LinearTemperatureScheduler(TemperatureScheduler):
         self.current_temp = max(self.current_temp - self.decay_rate, self.min_temp)
 
 class PolicyNetwork(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim=128, temperature=1.0):
+    def __init__(self, input_dim, output_dim, hidden_dim=128, temperature=2.0):
         super().__init__()
         self.temp_scheduler = LinearTemperatureScheduler(initial_temp=temperature)
         self.network = nn.Sequential(
@@ -90,7 +90,9 @@ class DeepPolicy(PolicyNetwork):
         if torch.isnan(x).any():
             raise ValueError(f"Input contains NaN values: {x}")
  
-        output = self.network(x)
+        output = self.network(x) / self.temp_scheduler.get_temperature()
+        if torch.isnan(output).any():
+            raise ValueError(f"Output contains NaN values after forward pass: {output}")
         return output
 
 class ResidualBlock(nn.Module):

@@ -21,8 +21,7 @@ except ImportError:
 
 class REINFORCEAgent(Agent):
     def __init__(self, name, learning_rate=0.01, gamma=0.99, experiment=None, 
-                 debug_timing=False, baseline_type: BaselineType = BaselineType.NONE, policy_network=None,
-                 policy_network_type: str = "reinforce"):
+                 debug_timing=False, baseline_type: BaselineType = BaselineType.NONE, policy_network=None):
         """Initialize the REINFORCE agent.
         Args:
             name (str): Name of the agent.
@@ -32,52 +31,18 @@ class REINFORCEAgent(Agent):
             debug_timing (bool): If True, enables detailed timing for debugging.
             baseline_type (BaselineType): Type of baseline to use for advantage estimation. Can be a tuple with (BaselineType, args).
             policy_network (nn.Module, optional): Custom policy network to use.
-            policy_network_type (str): Type of policy network to build if not provided ('reinforce', 'deep', 'deep_residual').
         """
         super().__init__(name=name, learning_rate=learning_rate, gamma=gamma, baseline_type=baseline_type)
         self.baseline = None
         self.debug_timing = debug_timing
         self.timer = PolicyGradientUtils.DebugTimer() if debug_timing else None
-        self.policy_network_type = policy_network_type 
 
         if experiment is not None:
             self.set_experiment(experiment, reset_policy_network=policy_network is None)
             if policy_network:
                 self.set_policy_network(policy_network)
      
-    def build_policy_network(self):
-        """Build and return the policy network for REINFORCE."""
-        from ..policies import REINFORCEPolicy, DeepPolicy, DeepResidualPolicy # Import other policies
-        
-        if self.env is None:
-            raise ValueError("Environment is not set. Call set_experiment() first.")
-        
-        obs_space = self.env.observation_space
-        action_space = self.env.action_space
-        
-        if obs_space is None or action_space is None:
-            raise ValueError("Environment's observation_space or action_space is not initialized.")
-        
-        if not hasattr(obs_space, "shape") or obs_space.shape is None:
-            raise ValueError("Observation space does not have a valid 'shape' attribute.")
-        
-        if not hasattr(action_space, "n"):
-            raise ValueError("Action space does not have a valid 'n' attribute.")
-        
-        # Allow selection of different policy networks
-        if self.policy_network_type == "reinforce":
-            network = REINFORCEPolicy(obs_space.shape[0], action_space.n)
-        elif self.policy_network_type == "deep":
-            # Example: Use DeepPolicy with default hidden_dims or allow configuration
-            network = DeepPolicy(obs_space.shape[0], action_space.n, hidden_dims=[128, 128])
-        elif self.policy_network_type == "deep_residual":
-            # Example: Use DeepResidualPolicy
-            network = DeepResidualPolicy(obs_space.shape[0], action_space.n, hidden_dims=[128, 128, 64, 64])
-        else:
-            raise ValueError(f"Unknown policy_network_type: {self.policy_network_type}")
-            
-        return network.to(self.device)
-    
+  
     def select_action(self, state):
         """Select an action based on the current state using the policy network.
         """
@@ -310,7 +275,7 @@ class REINFORCEAgent(Agent):
         self._initialize_wandb(wandb_logging, wandb_project, wandb_run, wandb_config,
                                episodes, max_steps, eval_every, eval_episodes)
         
-        best_eval_reward = -float('inf')
+        best_eval_reward = self.evaluation_best if hasattr(self, 'evaluation_best') else float('-inf')
         episodes_without_improvement = 0
         evaluation_results = []
         pbar = tqdm(range(episodes), desc="Training", unit="episode")
@@ -419,7 +384,7 @@ class REINFORCEAgent(Agent):
                         batch_rewards_sum, batch_lengths_sum = 0, 0
                         continue
                         
-                    loss = (-all_log_probs * all_returns).mean()
+                    loss = (-all_log_probs * all_returns).sum()
                     
                     # Add entropy regularization with stability checks
                     if all_logits is not None:
@@ -557,7 +522,8 @@ class REINFORCEAgent(Agent):
             wandb.finish()
         
         self.evaluation_results = evaluation_results
-        return evaluation_results
+        self.evaluation_best = best_eval_reward
+        return evaluation_results, best_eval_reward
 
     def plot_training_results(self):
         """Plot training results using seaborn."""

@@ -27,6 +27,7 @@ class Agent:
         self.policy_network = None
         self.optimizer = None
         if isinstance(baseline_type, BaselineType):
+            print(f"Using baseline type: {baseline_type}")
             self.baseline_type = baseline_type
             self.baseline_args = {}
         elif isinstance(baseline_type, tuple):
@@ -37,39 +38,57 @@ class Agent:
 
     def build_policy_network(self):
         from ..policies import PolicyNetwork
-        if self.env is None:
-            raise ValueError("Environment is not set. Call set_experiment() first.")
-        if self.env.observation_space is None or self.env.action_space is None:
-            raise ValueError("Environment's observation_space or action_space is not initialized.")
-        if not hasattr(self.env.observation_space, "shape") or self.env.observation_space.shape is None:
-            raise ValueError("Observation space does not have a valid 'shape' attribute.")
- 
-
-        
+        try:
+             self.check_env()
+        except ValueError as e:
+            raise ValueError(f"Environment is not set or not properly initialized: {e}")
         network = PolicyNetwork(self.env.observation_space.shape[0], self.env.action_space.n)
         return network.to(self.device)
 
+    def build_baseline(self):
+        """Builds the baseline network based on the specified baseline type.""" 
+        if self.baseline_type is None:
+            return BaselineFactory.create_baseline(self, BaselineType.NONE)
+        else:
+            try:
+                self.check_env()
+            except ValueError as e:
+               raise ValueError(f"Environment is not set or not properly initialized: {e}")
+            return BaselineFactory.create_baseline(
+                self,  
+                self.baseline_type,  
+                **self.baseline_args
+            )
+        
     def set_policy_network(self, policy_network, optimizer=None):
         self.policy_network = policy_network.to(self.device)
         if optimizer is not None:
             self.optimizer = optimizer
         else:
-            self.optimizer = optim.AdamW(self.policy_network.parameters(), lr=self.learning_rate, weight_decay=1e-5)
+            self.optimizer = optim.Adam(self.policy_network.parameters(), lr=self.learning_rate)
 
  
-
-    def set_experiment(self, experiment: 'Experiment', reset_policy_network=True):
+    def check_env(self):
+        """Check if the environment is set and properly initialized."""
+        if self.env is None:
+            raise ValueError("Environment is not set. Please set an environment using set_experiment() before training.")
+        if not isinstance(self.env, gym.Env):
+            raise ValueError("The environment must be an instance of gym.Env or a compatible environment.")
+        if not hasattr(self.env, 'observation_space') or not hasattr(self.env, 'action_space'):
+            raise ValueError("The environment must have observation_space and action_space attributes.")
+        
+    def set_experiment(self, experiment: 'Experiment', reset_policy_network=True, reset_baseline_network=True):
         from ..experiments import Experiment
         if not isinstance(experiment, Experiment):
             raise ValueError("experiment must be an instance of Experiment")
         self.experiment = experiment
         self.env = experiment.env
 
-        # Build policy network after environment is set
         if self.policy_network is None or reset_policy_network:
             self.policy_network = self.build_policy_network()
             self.optimizer = optim.Adam(self.policy_network.parameters(), lr=self.learning_rate)
-        self.baseline = BaselineFactory.create_baseline(self, self.baseline_type, **self.baseline_args)
+        if self.baseline is None or reset_baseline_network:
+            self.baseline = self.build_baseline()
 
     def select_action(self, state):
         import torch.nn.functional as F
@@ -104,6 +123,21 @@ class Agent:
 
     def train_online(self, episodes=1000, max_steps=200, render=False, wandb_logging=False):
         raise NotImplementedError("This method should be overridden by subclasses.")
+    
+    def load_state_dict(self, state_dict, val_to_beat=None):
+        """Load the state dictionary into the agent's policy network."""
+        if self.policy_network is None:
+            raise RuntimeError("Policy network is not set. Please set a policy network before loading state dict.")
+        self.policy_network.load_state_dict(state_dict)
+        if val_to_beat is not None:
+            self.evaluation_best = val_to_beat
+
+    def load_baseline_state_dict(self, state_dict):
+        """Load the state dictionary into the agent's baseline network."""
+        if self.baseline is None:
+            raise RuntimeError("Baseline network is not set. Please set a baseline network before loading state dict.")
+        self.baseline.load_state_dict(state_dict)
+
 
     def __str__(self):
         return self.name
