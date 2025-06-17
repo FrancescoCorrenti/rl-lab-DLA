@@ -21,6 +21,20 @@ class LinearTemperatureScheduler(TemperatureScheduler):
     def step(self):
         self.current_temp = max(self.current_temp - self.decay_rate, self.min_temp)
 
+class EpsilonScheduler:
+    """Simple epsilon decay scheduler for epsilon-greedy policies."""
+
+    def __init__(self, start=1.0, end=0.05, decay=0.995):
+        self.epsilon = start
+        self.end = end
+        self.decay = decay
+
+    def step(self):
+        self.epsilon = max(self.end, self.epsilon * self.decay)
+
+    def get_epsilon(self):
+        return self.epsilon
+
 class PolicyNetwork(nn.Module):
     def __init__(self, input_dim, output_dim, hidden_dim=128, temperature=2.0):
         super().__init__()
@@ -193,7 +207,23 @@ class DeepResidualPolicy(PolicyNetwork):
         # Validate input
         if torch.isnan(x).any():
             raise ValueError(f"Input contains NaN values: {x}")        
-        output = self.network(x) 
+        output = self.network(x)
         return output
+
+
+class QNetwork(nn.Module):
+    """Simple feed-forward network returning Q-values for each action."""
+
+    def __init__(self, input_dim, output_dim, hidden_dim=128):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x):
+        return self.network(x)
+
 
 
