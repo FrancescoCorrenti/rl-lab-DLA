@@ -390,3 +390,48 @@ class BaselineFactory:
         
         baseline_class = cls._baseline_classes[baseline_type]
         return baseline_class(agent, **kwargs)
+
+
+# -------------------------- Q-learning utilities ---------------------------
+
+class ReplayBuffer:
+    """Simple experience replay buffer for value-based methods."""
+
+    def __init__(self, capacity: int = 10000):
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+
+    def sample(self, batch_size: int, device=None):
+        import random
+        batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+
+        states = torch.stack([torch.as_tensor(s, dtype=torch.float32) for s in states]).to(device)
+        actions = torch.as_tensor(actions, dtype=torch.long, device=device)
+        rewards = torch.as_tensor(rewards, dtype=torch.float32, device=device)
+        next_states = torch.stack([torch.as_tensor(s, dtype=torch.float32) for s in next_states]).to(device)
+        dones = torch.as_tensor(dones, dtype=torch.float32, device=device)
+        return states, actions, rewards, next_states, dones
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+def compute_td_loss(policy_net: nn.Module, target_net: nn.Module, batch, gamma: float, optimizer=None):
+    """Compute and optionally apply the TD loss for a batch of transitions."""
+    states, actions, rewards, next_states, dones = batch
+    q_values = policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+    with torch.no_grad():
+        next_q = target_net(next_states).max(1)[0]
+        targets = rewards + gamma * (1 - dones) * next_q
+
+    loss = F.mse_loss(q_values, targets)
+
+    if optimizer is not None:
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    return loss
