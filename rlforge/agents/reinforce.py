@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from rlforge.experiments import Experiment
 from .agent import Agent
-from ..functional import BaselineType,BaselineFactory, PolicyGradientUtils
+from ..functional import BaselineType, BaselineFactory, PolicyGradientUtils, SchedulerType
 
 try:
     import wandb
@@ -230,8 +230,8 @@ class REINFORCEAgent(Agent):
                     eval_episodes=10, wandb_logging=False, wandb_project="reinforce-training", 
                     wandb_run=None, wandb_config=None, debug_timing=None, save_best_model_path: Optional[str] = None,
                     save_best_value_model_path: Optional[str] = None, entropy_beta=0.01, reload_best_after_episodes=-1, log_gradients=True, 
-                    log_gradients_every=10, batch_size=1, flush_experiment_every=-1, max_grad_norm=1, scheduler_type="cyclic",
-                    scheduler_step_size_up=100, scheduler_base_lr=1e-5): # Added scheduler params
+                    log_gradients_every=10, batch_size=1, flush_experiment_every=-1, max_grad_norm=1, scheduler_type: SchedulerType = SchedulerType.CYCLIC,
+                    scheduler_kwargs: Optional[dict] = None): # Added scheduler params
         """Train the agent using the REINFORCE algorithm.
         
         Args:
@@ -254,9 +254,8 @@ class REINFORCEAgent(Agent):
             batch_size (int): Number of episodes to accumulate before performing an update.
             flush_experiment_every (int): Flush experiment memory every N episodes to clear old data.
             max_grad_norm (float): Maximum gradient norm for clipping.
-            scheduler_type (str): Type of LR scheduler ('cyclic', 'step', 'none').
-            scheduler_step_size_up (int): For CyclicLR, steps to reach max_lr. For StepLR, step size.
-            scheduler_base_lr (float): For CyclicLR, the base learning rate.
+            scheduler_type (SchedulerType): Type of LR scheduler.
+            scheduler_kwargs (dict, optional): Arguments for the scheduler.
         """
         if self.experiment is None:
             raise RuntimeError("Experiment is not set. Please set an Experiment using set_experiment() before training.")
@@ -275,41 +274,30 @@ class REINFORCEAgent(Agent):
         self._initialize_wandb(wandb_logging, wandb_project, wandb_run, wandb_config,
                                episodes, max_steps, eval_every, eval_episodes)
         
+        # Initialize scheduler
+        scheduler_kwargs = scheduler_kwargs or {}
+        if scheduler_type == SchedulerType.CYCLIC:
+            scheduler_kwargs.setdefault('base_lr', 1e-5)
+            scheduler_kwargs.setdefault('max_lr', self.learning_rate)
+            scheduler_kwargs.setdefault('step_size_up', 100)
+            scheduler_kwargs.setdefault('mode', 'triangular2')
+        elif scheduler_type == SchedulerType.STEP:
+            scheduler_kwargs.setdefault('step_size', 100)
+            scheduler_kwargs.setdefault('gamma', 0.5)
+        self._initialize_scheduler(scheduler_type, scheduler_kwargs)
+
         best_eval_reward = self.evaluation_best if hasattr(self, 'evaluation_best') else float('-inf')
         episodes_without_improvement = 0
         evaluation_results = []
         pbar = tqdm(range(episodes), desc="Training", unit="episode")
         
-        # Flexible Scheduler Setup
-        if scheduler_type == "cyclic":
-            self.scheduler = torch.optim.lr_scheduler.CyclicLR(
-                    self.optimizer,
-                    base_lr=scheduler_base_lr, # Use parameter
-                    max_lr=self.learning_rate, # Max LR is the agent's main LR
-                    mode="triangular2",
-                    step_size_up=scheduler_step_size_up, # Use parameter
-                    last_epoch=-1                     
-            )
-            # Jump straight to the top of the first cycle *before* training starts
-            self.scheduler.step(scheduler_step_size_up) 
-        elif scheduler_type == "step":
-            self.scheduler = torch.optim.lr_scheduler.StepLR(
-                self.optimizer,
-                step_size=scheduler_step_size_up, # Reuse param for step_size
-                gamma=0.5 # Example decay, make this a parameter if needed
-            )
-        elif scheduler_type == "none":
-            self.scheduler = None # No scheduler, fixed learning rate
-        else:
-            raise ValueError(f"Unsupported scheduler_type: {scheduler_type}")
-
-
         # For batching
         batch_log_probs = []
         batch_rewards = []
         batch_returns = []
         batch_logits = []
         batch_states = []
+        batch_actions = []
         batch_rewards_sum = 0
         batch_lengths_sum = 0
         
@@ -355,6 +343,7 @@ class REINFORCEAgent(Agent):
                 batch_returns.append(returns_ep)
                 batch_logits.append(logits_ep)
                 batch_rewards.append(rewards_ep)
+                batch_actions.append(episode_data.get_actions(return_pt=True).to(self.device))
                 batch_states.append(episode_data.get_states(return_pt=True).to(self.device))
                 batch_rewards_sum += episode_data.total_reward
                 batch_lengths_sum += len(episode_data)
@@ -370,7 +359,8 @@ class REINFORCEAgent(Agent):
                 all_rewards = torch.cat(batch_rewards)
                 all_logits = torch.cat(batch_logits)
                 all_states = torch.cat(batch_states)
-                
+                all_actions = torch.cat(batch_actions)
+
                 # Update policy with timing
                 with self.timer.time_block("gradient_computation") if self.timer else nullcontext():           
                     if torch.isnan(all_log_probs).any() or torch.isnan(all_returns).any():
@@ -384,7 +374,7 @@ class REINFORCEAgent(Agent):
                         batch_rewards_sum, batch_lengths_sum = 0, 0
                         continue
                         
-                    loss = (-all_log_probs * all_returns).sum()
+                    loss = (-all_log_probs * all_returns).mean()
                     
                     # Add entropy regularization with stability checks
                     if all_logits is not None:
@@ -407,8 +397,7 @@ class REINFORCEAgent(Agent):
                     )) if self.baseline else None
                     torch.nn.utils.clip_grad_norm_(self.policy_network.parameters(), max_grad_norm)
                     self.optimizer.step()
-                    if self.scheduler:
-                        self.scheduler.step()  # Update scheduler
+                   
                
                 
                 # Log metrics for the batch
@@ -428,15 +417,10 @@ class REINFORCEAgent(Agent):
                         "batch_entropy_beta": current_beta if 'current_beta' in locals() else None,
                         "batch_entropy": entropy.item() if 'entropy' in locals() else None,
                         "learning_rate": self.optimizer.param_groups[0]['lr'],
+                        "batch_action": all_actions                  
                     }
-                    if self.debug_timing and self.timer:
-                        timing_stats = self.timer.get_all_stats()
-                        for name, stats in timing_stats.items():
-                            if stats:
-                                log_data[f"timing_{name}_mean_ms"] = stats['mean'] * 1000
-                                log_data[f"timing_{name}_current_ms"] = stats['current'] * 1000
-                    # Add scheduler type to logs
-                    log_data["scheduler_type"] = scheduler_type
+                    
+                 
                     wandb.log(log_data)
 
                 # Log gradients if enabled and at the right interval
@@ -543,6 +527,20 @@ class REINFORCEAgent(Agent):
         sns.lineplot(data=df, x='episode', y='avg_reward', marker='o', 
                     linewidth=2.5, markersize=6, ax=axes[0])
         axes[0].set_title('Average Reward During Training', fontsize=14, fontweight='bold')
+        axes[0].set_xlabel('Episode', fontsize=12)
+        axes[0].set_ylabel('Average Reward', fontsize=12)
+        axes[0].grid(True, alpha=0.3)
+        
+        # Plot average episode length
+        sns.lineplot(data=df, x='episode', y='avg_length', marker='s', color='orange',
+                    linewidth=2.5, markersize=6, ax=axes[1])
+        axes[1].set_title('Average Episode Length During Training', fontsize=14, fontweight='bold')
+        axes[1].set_xlabel('Episode', fontsize=12)
+        axes[1].set_ylabel('Average Episode Length', fontsize=12)
+        axes[1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
         axes[0].set_xlabel('Episode', fontsize=12)
         axes[0].set_ylabel('Average Reward', fontsize=12)
         axes[0].grid(True, alpha=0.3)

@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from typing import TYPE_CHECKING
 
-from rlforge.functional import BaselineFactory, BaselineType
+from rlforge.functional import BaselineFactory, BaselineType, SchedulerType
 
 if TYPE_CHECKING:
     from ..experiments import Experiment
@@ -25,7 +25,9 @@ class Agent:
         self.experiment = None
         self.env = None
         self.policy_network = None
+        self.baseline = None
         self.optimizer = None
+        self.scheduler = None
         if isinstance(baseline_type, BaselineType):
             print(f"Using baseline type: {baseline_type}")
             self.baseline_type = baseline_type
@@ -35,6 +37,32 @@ class Agent:
             self.baseline_args = baseline_type[1] if len(baseline_type) > 1 else {}
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
+
+    def _initialize_scheduler(self, scheduler_type: SchedulerType, scheduler_kwargs: dict):
+        """Initializes the learning rate scheduler."""
+        if scheduler_type == SchedulerType.NONE:
+            self.scheduler = None
+            return
+
+        if self.optimizer is None:
+            raise ValueError("Optimizer must be set before creating a scheduler.")
+
+        scheduler_class = {
+            SchedulerType.CYCLIC: torch.optim.lr_scheduler.CyclicLR,
+            SchedulerType.STEP: torch.optim.lr_scheduler.StepLR,
+            SchedulerType.EXPONENTIAL: torch.optim.lr_scheduler.ExponentialLR,
+            SchedulerType.COSINE_ANNEALING: torch.optim.lr_scheduler.CosineAnnealingLR,
+        }.get(scheduler_type)
+
+        if scheduler_class is None:
+            raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
+
+        # Default arguments can be handled here or passed in via scheduler_kwargs
+        self.scheduler = scheduler_class(self.optimizer, **scheduler_kwargs)
+
+        # Special handling for CyclicLR to start at max_lr
+        if scheduler_type == SchedulerType.CYCLIC and 'step_size_up' in scheduler_kwargs:
+            self.scheduler.step(scheduler_kwargs['step_size_up'])
 
     def build_policy_network(self):
         from ..policies import PolicyNetwork

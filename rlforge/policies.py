@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from rlforge.functional import ACTIVATION_FUNCTIONS
 class TemperatureScheduler:
     def __init__(self, initial_temp=1.0, min_temp=0.1):
         self.current_temp = initial_temp
@@ -67,21 +67,7 @@ class DeepPolicy(PolicyNetwork):
         in_dim = input_dim
         for dim in hidden_dims:
             layers.append(nn.Linear(in_dim, dim))
-            if activation == 'relu':
-                layers.append(nn.ReLU())
-            elif activation == 'elu':
-                layers.append(nn.ELU())
-            elif activation == 'tanh':
-                layers.append(nn.Tanh())
-            elif activation == 'leaky_relu':
-                layers.append(nn.LeakyReLU(negative_slope=0.01))
-            elif activation == 'sigmoid':
-                layers.append(nn.Sigmoid())
-            elif activation == 'swish':
-                layers.append(nn.SiLU())
-            elif activation == 'selu':
-                layers.append(nn.SELU())
-            # layers.append(nn.Dropout(0.2))
+            layers.append(ACTIVATION_FUNCTIONS[activation])
             in_dim = dim
         layers.append(nn.Linear(in_dim, output_dim))
         self.network = nn.Sequential(*layers)
@@ -123,22 +109,11 @@ class ResidualBlock(nn.Module):
             self.projection = nn.Linear(in_dim, out_dim)
     
     def _get_activation_fn(self, activation):
-        if activation == 'relu':
-            return nn.ReLU()
-        elif activation == 'elu':
-            return nn.ELU()
-        elif activation == 'tanh':
-            return nn.Tanh()
-        elif activation == 'leaky_relu':
-            return nn.LeakyReLU(negative_slope=0.01)
-        elif activation == 'sigmoid':
-            return nn.Sigmoid()
-        elif activation == 'swish':
-            return nn.SiLU()
-        elif activation == 'selu':
-            return nn.SELU()
+        """Get the activation function based on the string name."""
+        if activation in ACTIVATION_FUNCTIONS:
+            return ACTIVATION_FUNCTIONS[activation]
         else:
-            return nn.ReLU()
+            raise ValueError(f"Unsupported activation function: {activation}. Supported: {list(ACTIVATION_FUNCTIONS.keys())}")
     
     def forward(self, x):
         identity = x

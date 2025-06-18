@@ -9,7 +9,23 @@ from collections import defaultdict, deque
 import time
 from contextlib import contextmanager
 
+ACTIVATION_FUNCTIONS = {
+    "relu": nn.ReLU(),
+    "tanh": nn.Tanh(),
+    "sigmoid": nn.Sigmoid(),
+    "leaky_relu": nn.LeakyReLU(negative_slope=0.01),
+    "elu": nn.ELU(),
+    "selu": nn.SELU(),
+    "softmax": nn.Softmax(dim=-1),
+}
 
+class SchedulerType(Enum):
+    """Types of learning rate schedulers."""
+    NONE = "none"
+    CYCLIC = "cyclic"
+    STEP = "step"
+    EXPONENTIAL = "exponential"
+    COSINE_ANNEALING = "cosine_annealing"
 
 class BaselineType(Enum):
     """Types of baselines for variance reduction in policy gradient methods.
@@ -26,6 +42,9 @@ class BaselineType(Enum):
             "epsilon": float,        # Small value to avoid division by zero in normalization
             "init_gain": float,      # Gain for orthogonal initialization of weights
             "wandb_logging": bool     # Whether to log metrics to wandb
+            "momentum": float,  # Momentum for running statistics 
+            "activation": str,  # Activation function for the value network
+            "max_grad_norm": float  # Maximum gradient norm for clipping
         }
     """
 
@@ -270,13 +289,16 @@ class ValueFunctionBaseline(BaselineStrategy):
     def __init__(
         self,
         agent,
-        learning_rate: float = 5e-4,  # Critical: Tune this LR
-        hidden_dims: list = [128, 128], # Consider making this larger for LunarLander
-        normalize_returns: bool = False, # Experiment with True
-        normalize_advantages: bool = True, # Generally recommended to keep True
+        learning_rate: float = 5e-4, 
+        hidden_dims: list = [128, 128],
+        normalize_returns: bool = False, 
+        normalize_advantages: bool = True,
         epsilon: float = 1e-8,
         init_gain: float = 1.0,
-        wandb_logging: bool = True
+        wandb_logging: bool = True,
+        momentum: float = 0.01,  # Momentum for running statistics
+        activation: str = "relu",  # Activation function for the value network
+        max_grad_norm: float = 0.5  # Maximum gradient norm for clipping
     ):
         super().__init__(agent)
         
@@ -334,6 +356,7 @@ class ValueFunctionBaseline(BaselineStrategy):
         self._init_weights(init_gain)        
         self.optimizer = torch.optim.Adam(self.value_network.parameters(), lr=learning_rate)        
         self.epsilon = epsilon
+        self.max_grad_norm = max_grad_norm
         
         # Optional normalizers
         self.rewards_normalizer = (
@@ -359,13 +382,12 @@ class ValueFunctionBaseline(BaselineStrategy):
    
         # Compute value estimates
         if train:
-            self.train_step(episode_data)
-        else:
-            with torch.no_grad():
-                states = episode_data.get_states(return_pt=True).to(self.device)
-                rewards = episode_data.get_rewards(return_pt=True).to(self.device)
-                target_returns = self.rewards_normalizer(episode_data)
-                values = self.value_network(states).squeeze(-1)
+            self.train_step(episode_data)        
+        with torch.no_grad():
+            states = episode_data.get_states(return_pt=True).to(self.device)
+            rewards = episode_data.get_rewards(return_pt=True).to(self.device)
+            target_returns = self.rewards_normalizer(episode_data)
+            values = self.value_network(states).squeeze(-1)
         
         # Compute advantages
         advantages = target_returns - values.detach()
@@ -385,13 +407,7 @@ class ValueFunctionBaseline(BaselineStrategy):
         self.optimizer.zero_grad()
         loss.backward()
         
-        # Calculate gradient norm for logging
-        grad_norm = 0.0
-        for param in self.value_network.parameters():
-            if param.grad is not None:
-                grad_norm += param.grad.data.norm(2).item() ** 2
-        grad_norm = grad_norm ** 0.5
-        
+        torch.nn.utils.clip_grad_norm_(self.value_network.parameters(), self.max_grad_norm)
         self.optimizer.step()
         
         # Log metrics to wandb if available
@@ -403,8 +419,6 @@ class ValueFunctionBaseline(BaselineStrategy):
                     "value_function/value_std": values.std().item(),
                     "value_function/target_returns_mean": target_returns.mean().item(),
                     "value_function/target_returns_std": target_returns.std().item(),
-                    "value_function/explained_variance": 1 - (F.mse_loss(values, target_returns) / target_returns.var() + 1e-8),
-                    "value_function/grad_norm": grad_norm
                 })
         except Exception as e:
             print(f"Warning: Wandb logging for ValueFunctionBaseline encountered an error: {e}")
@@ -438,6 +452,7 @@ class ReplayBuffer:
 
     def __init__(self, capacity: int = 10000):
         self.buffer = deque(maxlen=capacity)
+        self.capacity = capacity
 
     def push(self, state, action, reward, next_state, done):
         self.buffer.append((state, action, reward, next_state, done))
@@ -466,7 +481,7 @@ def compute_td_loss(policy_net: nn.Module, target_net: nn.Module, batch, gamma: 
         next_q = target_net(next_states).max(1)[0]
         targets = rewards + gamma * (1 - dones) * next_q
 
-    loss = F.mse_loss(q_values, targets)
+    loss = F.huber_loss(q_values, targets)
 
     if optimizer is not None:
         optimizer.zero_grad()
