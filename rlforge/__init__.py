@@ -1,6 +1,8 @@
 # Import order matters to avoid circular imports
 from .policies import PolicyNetwork, REINFORCEPolicy
-from .experiments import StepData, EpisodeData, Memory, MemoryManager, Experiment
+from .data import StepData, EpisodeData
+from .memory import Memory, MemoryManager
+from .experiments import Experiment
 from .agents import Agent, REINFORCEAgent
 
 __all__ = [

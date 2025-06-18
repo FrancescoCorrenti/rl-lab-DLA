@@ -305,17 +305,7 @@ class QLearningAgent(Agent):
             # Store transitions and optimize
             with self.timer.time_block("data_preparation") if self.timer else nullcontext():
                 for step in episode_data.steps:
-                    # Convert numpy arrays to proper format for buffer
-                    state = step.state
-                    next_state = step.next_state
-                    
-                    self.buffer.push(
-                        state,
-                        step.action,
-                        step.reward,
-                        next_state,
-                        step.done,
-                    )
+                    self.buffer.push(step)
 
             # Optimize model multiple times per episode for better sample efficiency
             losses = []
