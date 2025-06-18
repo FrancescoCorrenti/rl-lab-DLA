@@ -224,11 +224,88 @@ class QLearningAgent(Agent):
 """
         return description
 
-    def train_online(self, episodes=500, max_steps=200, render_every=-1, eval_every=100, 
-                    eval_episodes=10, wandb_logging=False, wandb_project="dqn-training", 
-                    wandb_run=None, wandb_config=None, debug_timing=None, 
-                    save_best_model_path: Optional[str] = None, reload_best_after_episodes=-1, 
-                    log_gradients=True, log_gradients_every=10, flush_experiment_every=-1, 
+
+    def _run_episode(self, max_steps: int):
+        """Run a single episode and return the collected data."""
+        with self.timer.time_block("episode_execution") if self.timer else nullcontext():
+            return self.experiment.run_episode(agent=self, max_steps=max_steps, render=False)
+
+    def _process_batch(self, episode_data, max_grad_norm, num_updates):
+        """Store transitions and update the model."""
+        with self.timer.time_block("data_preparation") if self.timer else nullcontext():
+            for step in episode_data.steps:
+                self.buffer.push(step)
+        losses = []
+        with self.timer.time_block("gradient_computation") if self.timer else nullcontext():
+            for _ in range(num_updates):
+                loss = self._optimize_model()
+                if loss is not None:
+                    losses.append(loss)
+        if self.scheduler:
+            self.scheduler.step()
+        return losses
+
+    def _log_metrics(self, wandb_logging, episode, episode_data, losses):
+        if not wandb_logging:
+            return
+        log_data = {
+            "episode": episode + 1,
+            "episode_reward": episode_data.total_reward,
+            "episode_length": len(episode_data),
+            "epsilon": self.epsilon_scheduler.get_epsilon(),
+            "buffer_size": len(self.buffer),
+            "learning_rate": self.optimizer.param_groups[0]['lr']
+        }
+        if losses:
+            log_data.update({
+                "loss": sum(losses) / len(losses),
+                "loss_std": torch.tensor(losses).std().item() if len(losses) > 1 else 0
+            })
+        if self.debug_timing and self.timer:
+            timing_stats = self.timer.get_all_stats()
+            for name, stats in timing_stats.items():
+                if stats:
+                    log_data[f"timing_{name}_mean_ms"] = stats['mean'] * 1000
+                    log_data[f"timing_{name}_current_ms"] = stats['current'] * 1000
+        wandb.log(log_data)
+
+    def _maybe_evaluate(self, wandb_logging, episode, eval_every, eval_episodes, max_steps,
+                        best_eval_reward, episodes_without_improvement, reload_best_after_episodes,
+                        save_best_model_path):
+        evaluation_result = None
+        if eval_every > 0 and (episode + 1) % eval_every == 0:
+            eval_result = self._perform_evaluation(wandb_logging, episode, eval_episodes, max_steps)
+            evaluation_result = eval_result
+            if save_best_model_path and eval_result['avg_reward'] > best_eval_reward:
+                best_eval_reward = eval_result['avg_reward']
+                episodes_without_improvement = 0
+                os.makedirs(os.path.dirname(save_best_model_path), exist_ok=True)
+                torch.save(self.policy_network.state_dict(), save_best_model_path)
+                tqdm.write(f"New best model saved to {save_best_model_path} with avg reward: {best_eval_reward:.2f}")
+            else:
+                episodes_without_improvement += 1
+                if (reload_best_after_episodes > 0 and
+                        episodes_without_improvement >= reload_best_after_episodes and
+                        save_best_model_path and os.path.exists(save_best_model_path)):
+                    tqdm.write(f"No improvement for {episodes_without_improvement} evaluations. Reloading best model...")
+                    self.policy_network.load_state_dict(torch.load(save_best_model_path, map_location=self.device))
+                    episodes_without_improvement = 0
+                    if wandb_logging:
+                        wandb.log({
+                            "model_reloaded": True,
+                            "model_reload_episode": episode + 1,
+                            "best_reward_at_reload": best_eval_reward
+                        })
+                    tqdm.write(f"Best model reloaded from {save_best_model_path} (reward: {best_eval_reward:.2f})")
+            if self.debug_timing and self.timer:
+                self.timer.print_summary()
+                self.experiment.print_timing_summary()
+        return evaluation_result, best_eval_reward, episodes_without_improvement
+    def train_online(self, episodes=500, max_steps=200, render_every=-1, eval_every=100,
+                    eval_episodes=10, wandb_logging=False, wandb_project="dqn-training",
+                    wandb_run=None, wandb_config=None, debug_timing=None,
+                    save_best_model_path: Optional[str] = None, reload_best_after_episodes=-1,
+                    log_gradients=True, log_gradients_every=10, flush_experiment_every=-1,
                     max_grad_norm=1, scheduler_type: SchedulerType = SchedulerType.STEP):
         """Train the agent using Deep Q-Learning.
         
@@ -257,173 +334,73 @@ class QLearningAgent(Agent):
             self.train()
         if self.experiment is None:
             raise RuntimeError("Experiment is not set. Please set an Experiment using set_experiment() before training.")
-        
-        # Override debug timing if specified
+
         if debug_timing is not None:
             self.debug_timing = debug_timing
             self.timer = PolicyGradientUtils.DebugTimer() if debug_timing else None
 
         self.policy_network.train()
-        
-        # Print model and training description
         print(self._generate_model_description(episodes, max_steps, self.buffer.capacity, self.batch_size))
 
-        # Initialize wandb
         self._initialize_wandb(wandb_logging, wandb_project, wandb_run, wandb_config,
                                episodes, max_steps, eval_every, eval_episodes)
-        
-        # Initialize scheduler
+
         if isinstance(scheduler_type, tuple):
-            if isinstance(scheduler_type[1],dict):
+            if isinstance(scheduler_type[1], dict):
                 scheduler_type, scheduler_kwargs = scheduler_type
         elif isinstance(scheduler_type, SchedulerType):
             scheduler_kwargs = {}
         self._initialize_scheduler(scheduler_type, scheduler_kwargs)
+
         best_eval_reward = getattr(self, 'evaluation_best', float('-inf'))
         episodes_without_improvement = 0
         evaluation_results = []
         pbar = tqdm(range(episodes), desc="Training", unit="episode")
-        
+
         for episode in pbar:
             episode_start = time.perf_counter()
 
             if flush_experiment_every > 0 and (episode + 1) % flush_experiment_every == 0:
                 self.experiment.flush_memory()
                 tqdm.write(f"Flushed experiment memory at episode {episode + 1}.")
-            
-            # Run episode with timing
-            with self.timer.time_block("episode_execution") if self.timer else nullcontext():
-                episode_data = self.experiment.run_episode(agent=self, max_steps=max_steps, render=False)
-            
-            # Optional rendering
-            if render_every > 0 and (episode + 1) % render_every == 0:
-                with self.timer.time_block("rendering") if self.timer else nullcontext():
-                    self.policy_network.eval()
-                    self.experiment.run_episode(agent=self, max_steps=max_steps, render=True)
-                    self.policy_network.train()
 
-            # Store transitions and optimize
-            with self.timer.time_block("data_preparation") if self.timer else nullcontext():
-                for step in episode_data.steps:
-                    self.buffer.push(step)
+            episode_data = self._run_episode(max_steps)
 
-            # Optimize model multiple times per episode for better sample efficiency
-            losses = []
-            with self.timer.time_block("gradient_computation") if self.timer else nullcontext():
-                # Train multiple times per episode step for better sample efficiency
-                num_updates = min(len(episode_data.steps), 4)  # Limit updates per episode
-                for _ in range(num_updates):
-                    loss = self._optimize_model()
-                    if loss is not None:
-                        losses.append(loss)
+            losses = self._process_batch(episode_data, max_grad_norm,
+                                        min(len(episode_data.steps), 4))
 
-            # Epsilon decay and target network update
             self.epsilon_scheduler.step()
-            if (self.target_network and self.target_update > 0 and 
-                (episode + 1) % self.target_update == 0):
+            if (self.target_network and self.target_update > 0 and (episode + 1) % self.target_update == 0):
                 self.target_network.load_state_dict(self.policy_network.state_dict())
 
-            # Update scheduler
-            if self.scheduler:
-                self.scheduler.step()
+            self._log_metrics(wandb_logging, episode, episode_data, losses)
 
-            # Log training metrics
-            if wandb_logging:
-                log_data = {
-                    "episode": episode + 1,
-                    "episode_reward": episode_data.total_reward,
-                    "episode_length": len(episode_data),
-                    "epsilon": self.epsilon_scheduler.get_epsilon(),
-                    "buffer_size": len(self.buffer),
-                    "learning_rate": self.optimizer.param_groups[0]['lr']
-                }
-                
-                if losses:
-                    log_data.update({
-                        "loss": sum(losses) / len(losses),
-                        "loss_std": torch.tensor(losses).std().item() if len(losses) > 1 else 0
-                    })
-                
-                # Add timing metrics if debug timing is enabled
-                if self.debug_timing and self.timer:
-                    timing_stats = self.timer.get_all_stats()
-                    for name, stats in timing_stats.items():
-                        if stats:
-                            log_data[f"timing_{name}_mean_ms"] = stats['mean'] * 1000
-                            log_data[f"timing_{name}_current_ms"] = stats['current'] * 1000
-                
-                wandb.log(log_data)
-
-            # Log gradients if enabled
-            if log_gradients and wandb_logging and (episode + 1) % log_gradients_every == 0:
-                self._log_gradient_metrics(wandb_logging, episode + 1)
-
-            # Update progress bar
             episode_time = time.perf_counter() - episode_start
             avg_loss = sum(losses) / len(losses) if losses else 0
             desc = (f"Episode {episode+1} | Reward: {episode_data.total_reward:.2f} | "
                    f"Loss: {avg_loss:.4f} | ε: {self.epsilon_scheduler.get_epsilon():.3f}")
-
             if self.debug_timing:
                 desc += f" | Time: {episode_time*1000:.1f}ms"
-            
             if reload_best_after_episodes > 0 and save_best_model_path:
                 desc += f" | No improve: {episodes_without_improvement}/{reload_best_after_episodes}"
-            
             pbar.set_description(desc)
 
-            # Evaluation
-            if eval_every > 0 and (episode + 1) % eval_every == 0:
-                with self.timer.time_block("evaluation") if self.timer else nullcontext():
-                    eval_result = self._perform_evaluation(wandb_logging, episode, eval_episodes, max_steps)
-                    evaluation_results.append(eval_result)
-                    
-                    # Check if we have a new best model
-                    if save_best_model_path and eval_result['avg_reward'] > best_eval_reward:
-                        best_eval_reward = eval_result['avg_reward']
-                        episodes_without_improvement = 0
-                        
-                        save_dir = os.path.dirname(save_best_model_path)
-                        if save_dir and not os.path.exists(save_dir):
-                            os.makedirs(save_dir, exist_ok=True)
-                        
-                        torch.save(self.policy_network.state_dict(), save_best_model_path)
-                        tqdm.write(f"New best model saved to {save_best_model_path} with avg reward: {best_eval_reward:.2f}")
-                    else:
-                        episodes_without_improvement += 1
-                        
-                        if (reload_best_after_episodes > 0 and 
-                            episodes_without_improvement >= reload_best_after_episodes and 
-                            save_best_model_path and os.path.exists(save_best_model_path)):
-                            
-                            tqdm.write(f"No improvement for {episodes_without_improvement} evaluations. Reloading best model...")
-                            self.policy_network.load_state_dict(torch.load(save_best_model_path, map_location=self.device))
-                            episodes_without_improvement = 0
-                            
-                            if wandb_logging:
-                                wandb.log({
-                                    "model_reloaded": True,
-                                    "model_reload_episode": episode + 1,
-                                    "best_reward_at_reload": best_eval_reward
-                                })
-                            
-                            tqdm.write(f"Best model reloaded from {save_best_model_path} (reward: {best_eval_reward:.2f})")
-                
-                # Print timing summary during evaluation
-                if self.debug_timing and self.timer:
-                    self.timer.print_summary()
-                    self.experiment.print_timing_summary()
-        
+            eval_result, best_eval_reward, episodes_without_improvement = self._maybe_evaluate(
+                wandb_logging, episode, eval_every, eval_episodes, max_steps,
+                best_eval_reward, episodes_without_improvement,
+                reload_best_after_episodes, save_best_model_path)
+            if eval_result:
+                evaluation_results.append(eval_result)
+
         pbar.close()
-        
-        # Final timing summary
+
         if self.debug_timing and self.timer:
             print("\nFINAL TRAINING TIMING SUMMARY:")
             self.timer.print_summary()
-        
+
         if wandb_logging:
             wandb.finish()
-        
+
         self.evaluation_results = evaluation_results
         self.evaluation_best = best_eval_reward
         return evaluation_results, best_eval_reward
