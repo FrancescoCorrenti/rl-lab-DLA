@@ -41,6 +41,121 @@ class REINFORCEAgent(Agent):
             self.set_experiment(experiment, reset_policy_network=policy_network is None)
             if policy_network:
                 self.set_policy_network(policy_network)
+
+    def _run_episode(self, max_steps: int):
+        """Run a single episode and return the collected data."""
+        with self.timer.time_block("episode_execution") if self.timer else nullcontext():
+            return self.experiment.run_episode(agent=self, max_steps=max_steps, render=False)
+
+    def _process_batch(self, batch_log_probs, batch_returns, batch_logits, batch_rewards,
+                       batch_states, batch_actions, entropy_beta, max_grad_norm, batch_idx):
+        """Process a batch of episodes and update the policy."""
+        if not batch_log_probs:
+            return None, 0, 0, None, None, None, None
+
+        all_log_probs = torch.cat(batch_log_probs)
+        all_returns = torch.cat(batch_returns)
+        all_rewards = torch.cat(batch_rewards)
+        all_logits = torch.cat(batch_logits) if batch_logits[0] is not None else None
+        all_states = torch.cat(batch_states)
+        all_actions = torch.cat(batch_actions)
+
+        loss = (-all_log_probs * all_returns).mean()
+        entropy = None
+        current_beta = None
+        if all_logits is not None:
+            entropy = PolicyGradientUtils.compute_entropy(all_logits)
+            current_beta = entropy_beta if isinstance(entropy_beta, float) else entropy_beta(batch_idx)
+            if not torch.isnan(entropy).any() and not torch.isinf(entropy).any():
+                loss -= current_beta * entropy
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        if self.baseline:
+            from rlforge.functional import EpisodeData
+            self.baseline.train_step(EpisodeData.from_values(
+                log_probs=all_log_probs,
+                rewards=all_rewards,
+                states=all_states,
+            ))
+        torch.nn.utils.clip_grad_norm_(self.policy_network.parameters(), max_grad_norm)
+        self.optimizer.step()
+        if self.scheduler:
+            self.scheduler.step()
+
+        avg_reward = all_rewards.sum().item() / len(batch_log_probs)
+        avg_length = len(all_rewards) / len(batch_log_probs)
+        return loss, avg_reward, avg_length, entropy, current_beta, all_returns, all_actions
+
+    def _log_metrics(self, wandb_logging, episode, loss, returns, entropy, beta, actions,
+                     avg_reward, avg_length, log_gradients, log_gradients_every, batch_size_actual):
+        """Log training metrics and optionally gradients."""
+        if not wandb_logging:
+            return
+
+        log_data = {
+            "episode": episode + 1,
+            "batch_update_episode": episode + 1,
+            "avg_episode_reward_in_batch": avg_reward,
+            "avg_episode_length_in_batch": avg_length,
+            "loss": loss.item() if loss is not None else None,
+            "avg_return_in_batch": returns.mean().item() if returns is not None else None,
+            "std_return_in_batch": returns.std().item() if returns is not None else None,
+            "batch_size_actual": batch_size_actual,
+            "avg_entropy": entropy.item() if entropy is not None else None,
+            "batch_entropy_beta": beta,
+            "learning_rate": self.optimizer.param_groups[0]['lr'],
+            "batch_action": actions,
+        }
+
+        if self.debug_timing and self.timer:
+            timing_stats = self.timer.get_all_stats()
+            for name, stats in timing_stats.items():
+                if stats:
+                    log_data[f"timing_{name}_mean_ms"] = stats['mean'] * 1000
+                    log_data[f"timing_{name}_current_ms"] = stats['current'] * 1000
+
+        wandb.log(log_data)
+
+        if log_gradients and (episode + 1) % log_gradients_every == 0:
+            self._log_gradient_metrics(wandb_logging, episode + 1)
+
+    def _maybe_evaluate(self, wandb_logging, episode, eval_every, eval_episodes, max_steps,
+                        best_eval_reward, episodes_without_improvement, reload_best_after_episodes,
+                        save_best_model_path, save_best_value_model_path):
+        """Run evaluation periodically and manage best model saving/reloading."""
+        evaluation_result = None
+        if eval_every > 0 and (episode + 1) % eval_every == 0:
+            eval_result = self._perform_evaluation(wandb_logging, episode, eval_episodes, max_steps)
+            evaluation_result = eval_result
+            if save_best_model_path and eval_result['avg_reward'] > best_eval_reward:
+                best_eval_reward = eval_result['avg_reward']
+                episodes_without_improvement = 0
+                os.makedirs(os.path.dirname(save_best_model_path), exist_ok=True)
+                torch.save(self.policy_network.state_dict(), save_best_model_path)
+                if self.baseline and self.baseline_type == BaselineType.VALUE_FUNCTION:
+                    torch.save(self.baseline.value_network.state_dict(), save_best_value_model_path)
+                tqdm.write(f"New best model saved to {save_best_model_path} with avg reward: {best_eval_reward:.2f}")
+            else:
+                episodes_without_improvement += 1
+                if (reload_best_after_episodes > 0 and
+                        episodes_without_improvement >= reload_best_after_episodes and
+                        save_best_model_path and os.path.exists(save_best_model_path)):
+                    tqdm.write(f"No improvement for {episodes_without_improvement} evaluations. Reloading best model...")
+                    self.policy_network.load_state_dict(torch.load(save_best_model_path, map_location=self.device))
+                    episodes_without_improvement = 0
+                    if wandb_logging:
+                        wandb.log({
+                            "model_reloaded": True,
+                            "model_reload_episode": episode + 1,
+                            "best_reward_at_reload": best_eval_reward
+                        })
+                    tqdm.write(f"Best model reloaded from {save_best_model_path} (reward: {best_eval_reward:.2f})")
+            if self.debug_timing and self.timer:
+                self.timer.print_summary()
+                self.experiment.print_timing_summary()
+
+        return evaluation_result, best_eval_reward, episodes_without_improvement
      
   
     def select_action(self, state):
@@ -226,111 +341,71 @@ class REINFORCEAgent(Agent):
 """
         return description
 
-    def train_online(self, episodes=1000, max_steps=200, render_every=-1, eval_every=100, 
-                    eval_episodes=10, wandb_logging=False, wandb_project="reinforce-training", 
+    def train_online(self, episodes=1000, max_steps=200, render_every=-1, eval_every=100,
+                    eval_episodes=10, wandb_logging=False, wandb_project="reinforce-training",
                     wandb_run=None, wandb_config=None, debug_timing=None, save_best_model_path: Optional[str] = None,
-                    save_best_value_model_path: Optional[str] = None, entropy_beta=0.01, reload_best_after_episodes=-1, log_gradients=True, 
+                    save_best_value_model_path: Optional[str] = None, entropy_beta=0.01, reload_best_after_episodes=-1, log_gradients=True,
                     log_gradients_every=10, batch_size=1, flush_experiment_every=-1, max_grad_norm=1, scheduler_type: SchedulerType = SchedulerType.CYCLIC):
-        """Train the agent using the REINFORCE algorithm.
-        
-        Args:
-            episodes (int): Number of training episodes.
-            max_steps (int): Maximum steps per episode.
-            render_every (int): Render every N episodes (-1 to disable).
-            eval_every (int): Evaluate every N episodes.
-            eval_episodes (int): Number of episodes for evaluation.
-            wandb_logging (bool): Enable Weights & Biases logging.
-            wandb_project (str): W&B project name.
-            wandb_run (str): W&B run name.
-            wandb_config (dict): Additional W&B configuration.
-            debug_timing (bool): Enable timing debugging.
-            save_best_model_path (str): Path to save the best model.
-            entropy_beta (float): Entropy regularization coefficient.
-            reload_best_after_episodes (int): Number of evaluation periods without improvement 
-                                             before reloading best model. Set to 0 to disable.
-            log_gradients (bool): Enable gradient logging.
-            log_gradients_every (int): Log gradients every N episodes.
-            batch_size (int): Number of episodes to accumulate before performing an update.
-            flush_experiment_every (int): Flush experiment memory every N episodes to clear old data.
-            max_grad_norm (float): Maximum gradient norm for clipping.
-            scheduler_type (SchedulerType): Type of LR scheduler.
-        """
+        """Train the agent using the REINFORCE algorithm."""
         if self.experiment is None:
             raise RuntimeError("Experiment is not set. Please set an Experiment using set_experiment() before training.")
-        
-        # Override debug timing if specified
+
         if debug_timing is not None:
             self.debug_timing = debug_timing
             self.timer = PolicyGradientUtils.DebugTimer() if debug_timing else None
 
         self.policy_network.train()
-        
-        # Print model and training description
         print(self._generate_model_description(episodes, max_steps, batch_size, entropy_beta))
 
-        # Initialize wandb
         self._initialize_wandb(wandb_logging, wandb_project, wandb_run, wandb_config,
                                episodes, max_steps, eval_every, eval_episodes)
-        
-        # Initialize scheduler
+
         if isinstance(scheduler_type, tuple):
-            if isinstance(scheduler_type[1],dict):
+            if isinstance(scheduler_type[1], dict):
                 scheduler_type, scheduler_kwargs = scheduler_type
         elif isinstance(scheduler_type, SchedulerType):
             scheduler_kwargs = {}
         self._initialize_scheduler(scheduler_type, scheduler_kwargs)
 
-        best_eval_reward = self.evaluation_best if hasattr(self, 'evaluation_best') else float('-inf')
+        best_eval_reward = getattr(self, 'evaluation_best', float('-inf'))
         episodes_without_improvement = 0
         evaluation_results = []
         pbar = tqdm(range(episodes), desc="Training", unit="episode")
-        
-        # For batching
-        batch_log_probs = []
-        batch_rewards = []
-        batch_returns = []
-        batch_logits = []
-        batch_states = []
-        batch_actions = []
+
+        batch_log_probs, batch_returns = [], []
+        batch_logits, batch_rewards = [], []
+        batch_states, batch_actions = [], []
         batch_rewards_sum = 0
         batch_lengths_sum = 0
-        
+
         for episode in pbar:
             episode_start = time.perf_counter()
 
             if flush_experiment_every > 0 and (episode + 1) % flush_experiment_every == 0:
-                # Flush the experiment memory to clear old data
                 self.experiment.flush_memory()
                 tqdm.write(f"Flushed experiment memory at episode {episode + 1}.")
-            
-            # Run episode with timing
-            with self.timer.time_block("episode_execution") if self.timer else nullcontext():
-                episode_data = self.experiment.run_episode(agent=self, max_steps=max_steps, render=False)
-            
-            # Optional rendering
+
+            episode_data = self._run_episode(max_steps)
+
             if render_every > 0 and (episode + 1) % render_every == 0:
                 with self.timer.time_block("rendering") if self.timer else nullcontext():
                     self.policy_network.eval()
                     self.experiment.run_episode(agent=self, max_steps=max_steps, render=True)
                     self.policy_network.train()
 
-            # Compute returns with timing
             with self.timer.time_block("data_preparation") if self.timer else nullcontext():
                 logits_ep = episode_data.get_logits(return_pt=True).to(self.device)
                 log_probs_ep = episode_data.get_log_probs(return_pt=True).to(self.device)
-                
-                
+
                 if self.baseline is None:
                     rewards_ep = episode_data.get_rewards(return_pt=True).to(self.device)
                     returns_ep = PolicyGradientUtils.compute_discounted_returns(rewards_ep, self.gamma)
-                        
                 else:
                     rewards_ep = episode_data.get_rewards(return_pt=True).to(self.device)
                     returns_ep = self.baseline(episode_data, train=False)
                     if save_best_model_path and self.baseline_type == BaselineType.VALUE_FUNCTION:
                         save_best_value_model_path = save_best_model_path.replace(".pt", "_baseline.pt")
 
-          
                 returns_ep = returns_ep.to(self.device)
 
                 batch_log_probs.append(log_probs_ep)
@@ -342,163 +417,58 @@ class REINFORCEAgent(Agent):
                 batch_rewards_sum += episode_data.total_reward
                 batch_lengths_sum += len(episode_data)
 
-            # Perform update if batch is full or it's the last episode
             if (episode + 1) % batch_size == 0 or (episode + 1) == episodes:
-                if not batch_log_probs: # Skip if batch is empty (e.g. last episode was already processed)
+                if not batch_log_probs:
                     continue
 
-                # Concatenate data from the batch
-                all_log_probs = torch.cat(batch_log_probs)
-                all_returns = torch.cat(batch_returns)
-                all_rewards = torch.cat(batch_rewards)
-                all_logits = torch.cat(batch_logits)
-                all_states = torch.cat(batch_states)
-                all_actions = torch.cat(batch_actions)
+                loss, avg_batch_reward, avg_batch_length, entropy, current_beta, all_returns, all_actions = self._process_batch(
+                    batch_log_probs, batch_returns, batch_logits, batch_rewards,
+                    batch_states, batch_actions, entropy_beta, max_grad_norm,
+                    episode // batch_size)
 
-                # Update policy with timing
-                with self.timer.time_block("gradient_computation") if self.timer else nullcontext():           
-                    if torch.isnan(all_log_probs).any() or torch.isnan(all_returns).any():
-                        print(f"NaN detected in batch ending at episode {episode + 1} inputs. Skipping update.")
-                        if torch.isnan(all_log_probs).any():
-                            print(f"Log probabilities contain NaN values.")
-                        if torch.isnan(all_returns).any():
-                            print(f"Returns contain NaN values.")
-                        # Clear batch for next iteration
-                        batch_log_probs, batch_returns, batch_logits = [], [], []
-                        batch_rewards_sum, batch_lengths_sum = 0, 0
-                        continue
-                        
-                    loss = (-all_log_probs * all_returns).mean()
-                    
-                    # Add entropy regularization with stability checks
-                    if all_logits is not None:
-                        entropy = PolicyGradientUtils.compute_entropy(all_logits)
-                        current_beta = entropy_beta if isinstance(entropy_beta, float) else entropy_beta(episode // batch_size) # Use batch index for beta schedule
-                        
-                        if not torch.isnan(entropy).any() and not torch.isinf(entropy).any():
-                            loss -= current_beta * entropy
-                        else:
-                            print(f"Invalid entropy for batch ending at episode {episode + 1}. Skipping entropy regularization.")
+                self._log_metrics(wandb_logging, episode, loss, all_returns, entropy,
+                                  current_beta, all_actions, avg_batch_reward,
+                                  avg_batch_length, log_gradients,
+                                  log_gradients_every * batch_size, len(batch_log_probs))
 
-                with self.timer.time_block("optimizer_step") if self.timer else nullcontext():
-                    from rlforge.functional import EpisodeData
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    self.baseline.train_step(EpisodeData.from_values(
-                        log_probs=all_log_probs,
-                        rewards=all_rewards,
-                        states=all_states,
-                    )) if self.baseline else None
-                    torch.nn.utils.clip_grad_norm_(self.policy_network.parameters(), max_grad_norm)
-                    self.optimizer.step()
-               
-               
-                
-                # Log metrics for the batch
-                avg_batch_reward = batch_rewards_sum / len(batch_log_probs)
-                avg_batch_length = batch_lengths_sum / len(batch_log_probs)
-                if wandb_logging:
-                    log_data = {
-                        "episode": episode + 1,  # Log the actual episode number
-                        "batch_update_episode": episode + 1, # Log at the end of the batch
-                        "avg_episode_reward_in_batch": avg_batch_reward,
-                        "avg_episode_length_in_batch": avg_batch_length,
-                        "loss": loss.item(),
-                        "avg_return_in_batch": all_returns.mean().item(),
-                        "std_return_in_batch": all_returns.std().item(),
-                        "batch_size_actual": len(batch_log_probs),  # Actual number of episodes in this batch
-                        "avg_entropy": entropy.item() if 'entropy' in locals() else None,
-                        "batch_entropy_beta": current_beta if 'current_beta' in locals() else None,
-                        "batch_entropy": entropy.item() if 'entropy' in locals() else None,
-                        "learning_rate": self.optimizer.param_groups[0]['lr'],
-                        "batch_action": all_actions                  
-                    }
-                    
-                 
-                    wandb.log(log_data)
-
-                # Log gradients if enabled and at the right interval
-                if log_gradients and wandb_logging and (episode + 1) % (log_gradients_every * batch_size) == 0:
-                    self._log_gradient_metrics(wandb_logging, episode + 1)
-
-                # Clear batch for next iteration
-                batch_log_probs, batch_returns, batch_logits, batch_rewards, batch_states = [], [], [], [], []
+                batch_log_probs, batch_returns, batch_logits = [], [], []
+                batch_rewards, batch_states, batch_actions = [], [], []
                 batch_rewards_sum, batch_lengths_sum = 0, 0
-                
-                # Update progress bar with timing info (using last episode's data for simplicity or batch average)
+
                 episode_time = time.perf_counter() - episode_start
-                desc = (f"Episode {episode+1} (Batch End) | Avg Reward (Batch): {avg_batch_reward:.2f} | "
+                desc = (f"Episode {episode+1} (Batch End) | Avg Reward (Batch):{avg_batch_reward:.2f} | "
                        f"Loss: {loss.item():.4f} | Avg Return (Batch): {all_returns.mean().item():.2f}")
-            else: # Not end of batch yet
+            else:
                 episode_time = time.perf_counter() - episode_start
                 desc = (f"Episode {episode+1} | Reward: {episode_data.total_reward:.2f} | "
                        f"Return: {returns_ep.mean().item():.2f} (Collecting for batch)")
 
-
             if self.debug_timing:
                 desc += f" | Time: {episode_time*1000:.1f}ms"
-            
+
             if reload_best_after_episodes > 0 and save_best_model_path:
                 desc += f" | No improve: {episodes_without_improvement}/{reload_best_after_episodes}"
-            
+
             pbar.set_description(desc)
 
-            if eval_every > 0 and (episode + 1) % eval_every == 0:
-                with self.timer.time_block("evaluation") if self.timer else nullcontext():
-                    eval_result = self._perform_evaluation(wandb_logging, episode, eval_episodes, max_steps)
-                    evaluation_results.append(eval_result)
-                    # Check if we have a new best model
-                    if save_best_model_path and eval_result['avg_reward'] > best_eval_reward:
-                        best_eval_reward = eval_result['avg_reward']
-                        episodes_without_improvement = 0  # Reset counter on improvement
-                        current_beta = eval_result['entropy_beta'] if 'entropy_beta' in eval_result else None
-                        # Ensure the directory exists
-                        save_dir = os.path.dirname(save_best_model_path)
-                        if save_dir and not os.path.exists(save_dir):
-                            os.makedirs(save_dir, exist_ok=True)
-                        
-                        
-                        torch.save(self.policy_network.state_dict(), save_best_model_path)
-                        if self.baseline and self.baseline_type == BaselineType.VALUE_FUNCTION:
-                            torch.save(self.baseline.value_network.state_dict(), save_best_value_model_path)
-                        tqdm.write(f"New best model saved to {save_best_model_path} with avg reward: {best_eval_reward:.2f}")
-                    else:
-                        # No improvement - increment counter
-                        episodes_without_improvement += 1
-                        
-                        # Check if we should reload the best model
-                        if (reload_best_after_episodes > 0 and 
-                            episodes_without_improvement >= reload_best_after_episodes and 
-                            save_best_model_path and os.path.exists(save_best_model_path)):
-                            
-                            tqdm.write(f"No improvement for {episodes_without_improvement} evaluations. Reloading best model...")
-                            self.policy_network.load_state_dict(torch.load(save_best_model_path, map_location=self.device))
-                            episodes_without_improvement = 0  # Reset counter after reloading
-                            
-                            if wandb_logging:
-                                wandb.log({
-                                    "model_reloaded": True,
-                                    "model_reload_episode": episode + 1,
-                                    "best_reward_at_reload": best_eval_reward
-                                })
-                            
-                            tqdm.write(f"Best model reloaded from {save_best_model_path} (reward: {best_eval_reward:.2f})")
-                
-                # Print timing summary during evaluation
-                if self.debug_timing and self.timer:
-                    self.timer.print_summary()
-                    self.experiment.print_timing_summary()
-        
+            eval_result, best_eval_reward, episodes_without_improvement = self._maybe_evaluate(
+                wandb_logging, episode, eval_every, eval_episodes, max_steps,
+                best_eval_reward, episodes_without_improvement,
+                reload_best_after_episodes, save_best_model_path,
+                save_best_value_model_path)
+
+            if eval_result:
+                evaluation_results.append(eval_result)
+
         pbar.close()
-        
-        # Final timing summary
+
         if self.debug_timing and self.timer:
             print("\nFINAL TRAINING TIMING SUMMARY:")
             self.timer.print_summary()
-        
+
         if wandb_logging:
             wandb.finish()
-        
+
         self.evaluation_results = evaluation_results
         self.evaluation_best = best_eval_reward
         return evaluation_results, best_eval_reward
