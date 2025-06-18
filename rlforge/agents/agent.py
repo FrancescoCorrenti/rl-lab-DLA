@@ -131,7 +131,7 @@ class Agent:
     def train_online(self, episodes=1000, max_steps=200, render=False, wandb_logging=False):
         raise NotImplementedError("This method should be overridden by subclasses.")
     
-    def save_video(self, max_steps=200):
+    def save_video(self, max_steps=200, path=None):
         """
         Renders a video of the agent's performance for one episode.
         The experiment's `env_renderer` must be set up for rendering,
@@ -143,7 +143,7 @@ class Agent:
         if self.experiment is None:
             raise RuntimeError("Experiment is not set. Please set an Experiment using set_experiment() before rendering.")
         
-        self.experiment.save_video(agent=self, max_steps=max_steps)
+        self.experiment.save_video(agent=self, max_steps=max_steps, path=path)
 
     def render(self, max_steps=200):
         """
@@ -177,3 +177,4 @@ class Agent:
         return self.name
     def __repr__(self):
         return f"Agent(name={self.name}, learning_rate={self.learning_rate}, gamma={self.gamma})"
+    

@@ -36,9 +36,17 @@ class QLearningAgent(Agent):
         self.target_network = None
         self.debug_timing = debug_timing
         self.timer = DebugTimer() if debug_timing else None
-
+        self._is_eval = False 
         if experiment is not None:
             self.set_experiment(experiment)
+
+    def eval(self):
+        self._is_eval = True
+        self.epsilon_scheduler.eval()
+    
+    def train(self):
+        self._is_eval = False
+        self.epsilon_scheduler.train()
 
     def build_policy_network(self):
         if self.env is None:
@@ -54,7 +62,7 @@ class QLearningAgent(Agent):
         self.target_network.load_state_dict(self.policy_network.state_dict())
         self.target_network.eval()
 
-    def select_action(self, state):
+    def select_action(self, state):        
         epsilon = self.epsilon_scheduler.get_epsilon()
         if random.random() < epsilon:
             action = self.env.action_space.sample()
@@ -244,6 +252,8 @@ class QLearningAgent(Agent):
             scheduler_type (SchedulerType): Type of LR scheduler.
             scheduler_kwargs (dict, optional): Arguments for the scheduler.
         """
+        if self._is_eval:
+            self.train()
         if self.experiment is None:
             raise RuntimeError("Experiment is not set. Please set an Experiment using set_experiment() before training.")
         

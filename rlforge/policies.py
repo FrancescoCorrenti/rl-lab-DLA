@@ -22,18 +22,26 @@ class LinearTemperatureScheduler(TemperatureScheduler):
         self.current_temp = max(self.current_temp - self.decay_rate, self.min_temp)
 
 class EpsilonScheduler:
-    """Simple epsilon decay scheduler for epsilon-greedy policies."""
-
     def __init__(self, start=1.0, end=0.05, decay=0.995):
         self.epsilon = start
+        self.start = start
+        self.last_epsilon = start
         self.end = end
         self.decay = decay
 
     def step(self):
         self.epsilon = max(self.end, self.epsilon * self.decay)
+        self.last_epsilon = self.epsilon
 
     def get_epsilon(self):
         return self.epsilon
+    
+    def eval(self):
+        self.last_epsilon = self.epsilon
+        self.epsilon = 0
+    
+    def train(self):
+        self.epsilon = self.last_epsilon
 
 class PolicyNetwork(nn.Module):
     def __init__(self, input_dim, output_dim, hidden_dim=128, temperature=2.0):

@@ -393,7 +393,7 @@ class Experiment:
         
         return episode_data
 
-    def save_video(self, agent: 'Agent', max_steps=200):
+    def save_video(self, agent: 'Agent', max_steps=200, path=None):
         """
         Renders a video of the agent's performance for one episode using `self.env_renderer`.
         To save the video, `self.env_renderer` should be a `gym.wrappers.RecordVideo` instance.
@@ -408,7 +408,7 @@ class Experiment:
             print("Warning: env_renderer is not set. Cannot render video.")
             return
         if not isinstance(self.env_renderer, RecordVideo):
-            self.env_renderer = RecordVideo(self.env_renderer, f"videos/{self.name}_episode", episode_trigger=lambda ep: True)
+            self.env_renderer = RecordVideo(self.env_renderer, path or f"videos/{self.name}_episode", episode_trigger=lambda ep: True)
 
         print("Rendering episode...")
         episode_data = self.run_episode(agent=agent, max_steps=max_steps, render=True, store_in_memory=False)
