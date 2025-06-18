@@ -1,7 +1,7 @@
 from enum import Enum
 
 import wandb
-from rlforge.experiments import EpisodeData
+from rlforge.data import EpisodeData, StepData
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -455,19 +455,23 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=capacity)
         self.capacity = capacity
 
-    def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
+    def push(self, step: StepData):
+        """Add a transition to the buffer."""
+        self.buffer.append(step)
+
+    def push_episode(self, episode: EpisodeData):
+        """Add all transitions from an episode."""
+        for step in episode.steps:
+            self.push(step)
 
     def sample(self, batch_size: int, device=None):
         import random
         batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
-
-        states = torch.stack([torch.as_tensor(s, dtype=torch.float32) for s in states]).to(device)
-        actions = torch.as_tensor(actions, dtype=torch.long, device=device)
-        rewards = torch.as_tensor(rewards, dtype=torch.float32, device=device)
-        next_states = torch.stack([torch.as_tensor(s, dtype=torch.float32) for s in next_states]).to(device)
-        dones = torch.as_tensor(dones, dtype=torch.float32, device=device)
+        states = torch.stack([torch.as_tensor(s.state, dtype=torch.float32) for s in batch]).to(device)
+        actions = torch.as_tensor([s.action for s in batch], dtype=torch.long, device=device)
+        rewards = torch.as_tensor([s.reward for s in batch], dtype=torch.float32, device=device)
+        next_states = torch.stack([torch.as_tensor(s.next_state, dtype=torch.float32) for s in batch]).to(device)
+        dones = torch.as_tensor([s.done for s in batch], dtype=torch.float32, device=device)
         return states, actions, rewards, next_states, dones
 
     def __len__(self):
