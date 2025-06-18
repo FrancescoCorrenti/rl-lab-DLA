@@ -346,7 +346,7 @@ class Experiment:
         """Add a new named memory."""
         return self.memory_manager.add_memory(name)
 
-    def run_episode(self, agent: 'REINFORCEAgent', max_steps=200, render=False, memory_name=None, debug_timing=None):
+    def run_episode(self, agent: 'Agent', max_steps=200, render=False, memory_name=None, debug_timing=None, store_in_memory=True):
         """
         Run a single episode of the experiment.
         """
@@ -387,10 +387,35 @@ class Experiment:
                 break
 
             state = next_state
-        with self.timer.time_block("memory_storage") if self.timer else nullcontext():
-            memory.add(episode_data)
+        if store_in_memory:
+            with self.timer.time_block("memory_storage") if self.timer else nullcontext():
+                memory.add(episode_data)
         
         return episode_data
+
+    def save_video(self, agent: 'Agent', max_steps=200):
+        """
+        Renders a video of the agent's performance for one episode using `self.env_renderer`.
+        To save the video, `self.env_renderer` should be a `gym.wrappers.RecordVideo` instance.
+        The video is saved when `self.env_renderer.close()` is called. This function handles that.
+
+        Args:
+            agent (Agent): The agent to evaluate.
+            max_steps (int): Maximum steps per episode.
+        """
+        from gymnasium.wrappers import RecordVideo
+        if self.env_renderer is None:
+            print("Warning: env_renderer is not set. Cannot render video.")
+            return
+        if not isinstance(self.env_renderer, RecordVideo):
+            self.env_renderer = RecordVideo(self.env_renderer, f"videos/{self.name}_episode", episode_trigger=lambda ep: True)
+
+        print("Rendering episode...")
+        episode_data = self.run_episode(agent=agent, max_steps=max_steps, render=True, store_in_memory=False)
+        
+        self.env_renderer.close()
+        
+        print(f"Episode finished. Total reward: {episode_data.total_reward}. ")
 
     def get_rewards(self, memory_name=None, return_pt=False, flatten=False):
         """

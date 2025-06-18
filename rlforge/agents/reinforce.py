@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from rlforge.experiments import Experiment
 from .agent import Agent
-from ..functional import BaselineType, BaselineFactory, PolicyGradientUtils, SchedulerType
+from ..functional import BaselineType, PolicyGradientUtils, SchedulerType, DebugTimer
 
 try:
     import wandb
@@ -35,7 +35,7 @@ class REINFORCEAgent(Agent):
         super().__init__(name=name, learning_rate=learning_rate, gamma=gamma, baseline_type=baseline_type)
         self.baseline = None
         self.debug_timing = debug_timing
-        self.timer = PolicyGradientUtils.DebugTimer() if debug_timing else None
+        self.timer = DebugTimer() if debug_timing else None
 
         if experiment is not None:
             self.set_experiment(experiment, reset_policy_network=policy_network is None)
@@ -230,8 +230,7 @@ class REINFORCEAgent(Agent):
                     eval_episodes=10, wandb_logging=False, wandb_project="reinforce-training", 
                     wandb_run=None, wandb_config=None, debug_timing=None, save_best_model_path: Optional[str] = None,
                     save_best_value_model_path: Optional[str] = None, entropy_beta=0.01, reload_best_after_episodes=-1, log_gradients=True, 
-                    log_gradients_every=10, batch_size=1, flush_experiment_every=-1, max_grad_norm=1, scheduler_type: SchedulerType = SchedulerType.CYCLIC,
-                    scheduler_kwargs: Optional[dict] = None): # Added scheduler params
+                    log_gradients_every=10, batch_size=1, flush_experiment_every=-1, max_grad_norm=1, scheduler_type: SchedulerType = SchedulerType.CYCLIC):
         """Train the agent using the REINFORCE algorithm.
         
         Args:
@@ -255,7 +254,6 @@ class REINFORCEAgent(Agent):
             flush_experiment_every (int): Flush experiment memory every N episodes to clear old data.
             max_grad_norm (float): Maximum gradient norm for clipping.
             scheduler_type (SchedulerType): Type of LR scheduler.
-            scheduler_kwargs (dict, optional): Arguments for the scheduler.
         """
         if self.experiment is None:
             raise RuntimeError("Experiment is not set. Please set an Experiment using set_experiment() before training.")
@@ -275,15 +273,11 @@ class REINFORCEAgent(Agent):
                                episodes, max_steps, eval_every, eval_episodes)
         
         # Initialize scheduler
-        scheduler_kwargs = scheduler_kwargs or {}
-        if scheduler_type == SchedulerType.CYCLIC:
-            scheduler_kwargs.setdefault('base_lr', 1e-5)
-            scheduler_kwargs.setdefault('max_lr', self.learning_rate)
-            scheduler_kwargs.setdefault('step_size_up', 100)
-            scheduler_kwargs.setdefault('mode', 'triangular2')
-        elif scheduler_type == SchedulerType.STEP:
-            scheduler_kwargs.setdefault('step_size', 100)
-            scheduler_kwargs.setdefault('gamma', 0.5)
+        if isinstance(scheduler_type, tuple):
+            if isinstance(scheduler_type[1],dict):
+                scheduler_type, scheduler_kwargs = scheduler_type
+        elif isinstance(scheduler_type, SchedulerType):
+            scheduler_kwargs = {}
         self._initialize_scheduler(scheduler_type, scheduler_kwargs)
 
         best_eval_reward = self.evaluation_best if hasattr(self, 'evaluation_best') else float('-inf')
@@ -397,7 +391,7 @@ class REINFORCEAgent(Agent):
                     )) if self.baseline else None
                     torch.nn.utils.clip_grad_norm_(self.policy_network.parameters(), max_grad_norm)
                     self.optimizer.step()
-                   
+               
                
                 
                 # Log metrics for the batch
@@ -535,6 +529,12 @@ class REINFORCEAgent(Agent):
         sns.lineplot(data=df, x='episode', y='avg_length', marker='s', color='orange',
                     linewidth=2.5, markersize=6, ax=axes[1])
         axes[1].set_title('Average Episode Length During Training', fontsize=14, fontweight='bold')
+        axes[1].set_xlabel('Episode', fontsize=12)
+        axes[1].set_ylabel('Average Episode Length', fontsize=12)
+        axes[1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
         axes[1].set_xlabel('Episode', fontsize=12)
         axes[1].set_ylabel('Average Episode Length', fontsize=12)
         axes[1].grid(True, alpha=0.3)

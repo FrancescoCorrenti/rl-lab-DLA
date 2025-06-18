@@ -54,21 +54,7 @@ class BaselineType(Enum):
     VALUE_FUNCTION = "value_function"
 
 
-class PolicyGradientUtils:
-    """Utility functions for policy gradient algorithms."""
-    
-    @staticmethod
-    def compute_discounted_returns(rewards, gamma=None):
-        if isinstance(rewards, EpisodeData):
-            rewards = rewards.get_rewards(return_pt=True)
-        rewards = rewards.to(torch.float64)
-        T = rewards.size(0)
-        gamma_powers = gamma ** torch.arange(T, dtype=torch.float64, device=rewards.device)
-        discounted = rewards * gamma_powers
-        returns = torch.flip(torch.cumsum(torch.flip(discounted, [0]), 0), [0])
-        return returns.float()
-   
-    class DebugTimer:
+class DebugTimer:
         """Utility class for accurate timing measurements during training."""
         
         def __init__(self, window_size=100):
@@ -120,6 +106,21 @@ class PolicyGradientUtils:
                         f"Max: {stats['max']*1000:6.2f}ms | "
                         f"Current: {stats['current']*1000:6.2f}ms")
             print("="*60)
+
+class PolicyGradientUtils:
+    """Utility functions for policy gradient algorithms."""
+    
+    @staticmethod
+    def compute_discounted_returns(rewards, gamma=None):
+        if isinstance(rewards, EpisodeData):
+            rewards = rewards.get_rewards(return_pt=True)
+        rewards = rewards.to(torch.float64)
+        T = rewards.size(0)
+        gamma_powers = gamma ** torch.arange(T, dtype=torch.float64, device=rewards.device)
+        discounted = rewards * gamma_powers
+        returns = torch.flip(torch.cumsum(torch.flip(discounted, [0]), 0), [0])
+        return returns.float()  
+    
 
     def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
         """Compute the entropy of a probability distribution given logits."""
@@ -473,19 +474,40 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-def compute_td_loss(policy_net: nn.Module, target_net: nn.Module, batch, gamma: float, optimizer=None):
-    """Compute and optionally apply the TD loss for a batch of transitions."""
-    states, actions, rewards, next_states, dones = batch
-    q_values = policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
-    with torch.no_grad():
-        next_q = target_net(next_states).max(1)[0]
-        targets = rewards + gamma * (1 - dones) * next_q
+class TDUtils:
+    pass
 
-    loss = F.huber_loss(q_values, targets)
+class SchedulerFactory:
+    """Factory for creating learning rate schedulers."""
+    
+    @classmethod
+    def create_scheduler(cls,optimizer, scheduler_type: SchedulerType, **kwargs):
+        """Create a learning rate scheduler based on the specified type."""
+        if scheduler_type == SchedulerType.NONE:
+            return None
+        
+        if kwargs == {} or kwargs is None:
+            kwargs = cls.get_default_kwargs(scheduler_type)
 
-    if optimizer is not None:
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-    return loss
+        scheduler_class = {
+            SchedulerType.CYCLIC: torch.optim.lr_scheduler.CyclicLR,
+            SchedulerType.STEP: torch.optim.lr_scheduler.StepLR,
+            SchedulerType.EXPONENTIAL: torch.optim.lr_scheduler.ExponentialLR,
+            SchedulerType.COSINE_ANNEALING: torch.optim.lr_scheduler.CosineAnnealingLR,
+        }.get(scheduler_type)
+        
+        if scheduler_class is None:
+            raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
+        
+        return scheduler_class(optimizer, **kwargs)
+    
+    @staticmethod
+    def get_default_kwargs(scheduler_type: SchedulerType):  
+        """Get default keyword arguments for the specified scheduler type."""
+        defaults = {
+            SchedulerType.CYCLIC: {"base_lr": 0.001, "max_lr": 0.01, "step_size_up": 2000, "mode": "triangular"},
+            SchedulerType.STEP: {"step_size": 10000, "gamma": 0.1},
+            SchedulerType.EXPONENTIAL: {"gamma": 0.99},
+            SchedulerType.COSINE_ANNEALING: {"T_max": 10000, "eta_min": 0.001},
+        }
+        return defaults.get(scheduler_type, {})

@@ -1,5 +1,7 @@
 import random
 import torch
+import torch.nn.functional as F
+import torch.nn as nn
 import time
 import os
 from typing import Optional
@@ -7,7 +9,7 @@ from contextlib import contextmanager, nullcontext
 from tqdm import tqdm
 
 from .agent import Agent
-from ..functional import ReplayBuffer, compute_td_loss, BaselineType, PolicyGradientUtils, SchedulerType
+from ..functional import ReplayBuffer, BaselineType, SchedulerType, TDUtils, DebugTimer
 from ..policies import QNetwork, EpsilonScheduler
 
 try:
@@ -33,7 +35,7 @@ class QLearningAgent(Agent):
         self.epsilon_scheduler = EpsilonScheduler(epsilon_start, epsilon_end, epsilon_decay)
         self.target_network = None
         self.debug_timing = debug_timing
-        self.timer = PolicyGradientUtils.DebugTimer() if debug_timing else None
+        self.timer = DebugTimer() if debug_timing else None
 
         if experiment is not None:
             self.set_experiment(experiment)
@@ -218,8 +220,7 @@ class QLearningAgent(Agent):
                     wandb_run=None, wandb_config=None, debug_timing=None, 
                     save_best_model_path: Optional[str] = None, reload_best_after_episodes=-1, 
                     log_gradients=True, log_gradients_every=10, flush_experiment_every=-1, 
-                    max_grad_norm=1, scheduler_type: SchedulerType = SchedulerType.STEP, 
-                    scheduler_kwargs: Optional[dict] = None):
+                    max_grad_norm=1, scheduler_type: SchedulerType = SchedulerType.STEP):
         """Train the agent using Deep Q-Learning.
         
         Args:
@@ -261,17 +262,12 @@ class QLearningAgent(Agent):
                                episodes, max_steps, eval_every, eval_episodes)
         
         # Initialize scheduler
-        scheduler_kwargs = scheduler_kwargs or {}
-        if scheduler_type == SchedulerType.CYCLIC:
-            scheduler_kwargs.setdefault('base_lr', 1e-5)
-            scheduler_kwargs.setdefault('max_lr', self.learning_rate)
-            scheduler_kwargs.setdefault('step_size_up', 100)
-            scheduler_kwargs.setdefault('mode', 'triangular2')
-        elif scheduler_type == SchedulerType.STEP:
-            scheduler_kwargs.setdefault('step_size', 100)
-            scheduler_kwargs.setdefault('gamma', 0.5)
+        if isinstance(scheduler_type, tuple):
+            if isinstance(scheduler_type[1],dict):
+                scheduler_type, scheduler_kwargs = scheduler_type
+        elif isinstance(scheduler_type, SchedulerType):
+            scheduler_kwargs = {}
         self._initialize_scheduler(scheduler_type, scheduler_kwargs)
-
         best_eval_reward = getattr(self, 'evaluation_best', float('-inf'))
         episodes_without_improvement = 0
         evaluation_results = []
@@ -463,15 +459,31 @@ class QLearningAgent(Agent):
         
         plt.tight_layout()
         plt.show()
-        
-        # Plot average episode length
-        sns.lineplot(data=df, x='episode', y='avg_length', marker='s', color='orange',
-                    linewidth=2.5, markersize=6, ax=axes[1])
-        axes[1].set_title('Average Episode Length During Training', fontsize=14, fontweight='bold')
-        axes[1].set_xlabel('Episode', fontsize=12)
-        axes[1].set_ylabel('Average Episode Length', fontsize=12)
-        axes[1].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.show()
 
+    def load_state_dict(self, state_dict, val_to_beat=None):
+        if isinstance(state_dict, str):
+            if not os.path.exists(state_dict):
+                raise FileNotFoundError(f"State dict file '{state_dict}' does not exist.")
+            state_dict = torch.load(state_dict, map_location=self.device)
+        self.policy_network.load_state_dict(state_dict)
+        self.target_network.load_state_dict(state_dict)
+        if val_to_beat is not None:
+            self.evaluation_best = val_to_beat
+
+def compute_td_loss(policy_net: nn.Module, target_net: nn.Module, batch, gamma: float, optimizer=None):
+        """Compute and optionally apply the TD loss for a batch of transitions."""
+        
+        states, actions, rewards, next_states, dones = batch
+        q_values = policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        with torch.no_grad():
+            next_q = target_net(next_states).max(1)[0]
+            targets = rewards + gamma * (1 - dones) * next_q
+
+        loss = F.huber_loss(q_values, targets)
+
+        if optimizer is not None:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        return loss

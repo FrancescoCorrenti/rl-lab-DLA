@@ -40,29 +40,8 @@ class Agent:
 
     def _initialize_scheduler(self, scheduler_type: SchedulerType, scheduler_kwargs: dict):
         """Initializes the learning rate scheduler."""
-        if scheduler_type == SchedulerType.NONE:
-            self.scheduler = None
-            return
-
-        if self.optimizer is None:
-            raise ValueError("Optimizer must be set before creating a scheduler.")
-
-        scheduler_class = {
-            SchedulerType.CYCLIC: torch.optim.lr_scheduler.CyclicLR,
-            SchedulerType.STEP: torch.optim.lr_scheduler.StepLR,
-            SchedulerType.EXPONENTIAL: torch.optim.lr_scheduler.ExponentialLR,
-            SchedulerType.COSINE_ANNEALING: torch.optim.lr_scheduler.CosineAnnealingLR,
-        }.get(scheduler_type)
-
-        if scheduler_class is None:
-            raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
-
-        # Default arguments can be handled here or passed in via scheduler_kwargs
-        self.scheduler = scheduler_class(self.optimizer, **scheduler_kwargs)
-
-        # Special handling for CyclicLR to start at max_lr
-        if scheduler_type == SchedulerType.CYCLIC and 'step_size_up' in scheduler_kwargs:
-            self.scheduler.step(scheduler_kwargs['step_size_up'])
+        from rlforge.functional import SchedulerFactory
+        self.scheduler = SchedulerFactory.create_scheduler(self.optimizer, scheduler_type, **scheduler_kwargs)
 
     def build_policy_network(self):
         from ..policies import PolicyNetwork
@@ -152,6 +131,33 @@ class Agent:
     def train_online(self, episodes=1000, max_steps=200, render=False, wandb_logging=False):
         raise NotImplementedError("This method should be overridden by subclasses.")
     
+    def save_video(self, max_steps=200):
+        """
+        Renders a video of the agent's performance for one episode.
+        The experiment's `env_renderer` must be set up for rendering,
+        e.g., with `gym.wrappers.RecordVideo`.
+
+        Args:
+            max_steps (int): Maximum steps per episode.
+        """
+        if self.experiment is None:
+            raise RuntimeError("Experiment is not set. Please set an Experiment using set_experiment() before rendering.")
+        
+        self.experiment.save_video(agent=self, max_steps=max_steps)
+
+    def render(self, max_steps=200):
+        """
+        Renders the agent's performance for one episode.
+        The experiment's `env_renderer` must be set up for rendering.
+
+        Args:
+            max_steps (int): Maximum steps per episode.
+        """
+        if self.experiment is None:
+            raise RuntimeError("Experiment is not set. Please set an Experiment using set_experiment() before rendering.")
+        
+        self.experiment.run_episode(agent=self, max_steps=max_steps, render=True)
+
     def load_state_dict(self, state_dict, val_to_beat=None):
         """Load the state dictionary into the agent's policy network."""
         if self.policy_network is None:
