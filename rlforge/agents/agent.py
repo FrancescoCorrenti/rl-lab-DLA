@@ -177,4 +177,3 @@ class Agent:
         return self.name
     def __repr__(self):
         return f"Agent(name={self.name}, learning_rate={self.learning_rate}, gamma={self.gamma})"
-    

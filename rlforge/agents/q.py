@@ -149,6 +149,7 @@ class QLearningAgent(Agent):
 
     def _perform_evaluation(self, wandb_logging, episode, eval_episodes, max_steps):
         """Perform evaluation and log results."""
+        self.eval()  # Set to evaluation mode
         if hasattr(self, '_last_eval_output') and self._last_eval_output:
             print(f"\033[{self._last_eval_output}A", end="")
             print("\033[J", end="")
@@ -174,7 +175,7 @@ class QLearningAgent(Agent):
         lines_used += 1
         
         self._last_eval_output = lines_used
-        
+        self.train()
         return evaluation_result
 
     def _generate_model_description(self, episodes, max_steps, buffer_capacity, batch_size):
