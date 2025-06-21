@@ -1,5 +1,6 @@
 from enum import Enum
 
+import numpy as np
 import wandb
 from rlforge.data import EpisodeData, StepData
 import torch
@@ -20,7 +21,14 @@ ACTIVATION_FUNCTIONS = {
 }
 
 class SchedulerType(Enum):
-    """Types of learning rate schedulers."""
+    """
+    Types of learning rate schedulers.
+    - NONE: No scheduler, learning rate remains constant.
+    - CYCLIC: Cyclic learning rate scheduler.
+    - STEP: Step learning rate scheduler that reduces the learning rate at specified intervals.
+    - EXPONENTIAL: Exponential decay learning rate scheduler.
+    - COSINE_ANNEALING: Cosine annealing learning rate scheduler.
+    """
     NONE = "none"
     CYCLIC = "cyclic"
     STEP = "step"
@@ -111,7 +119,7 @@ class PolicyGradientUtils:
     """Utility functions for policy gradient algorithms."""
     
     @staticmethod
-    def compute_discounted_returns(rewards, gamma=None):
+    def compute_discounted_returns(rewards, gamma=None, normalize=True):
         if isinstance(rewards, EpisodeData):
             rewards = rewards.get_rewards(return_pt=True)
         rewards = rewards.to(torch.float64)
@@ -119,8 +127,10 @@ class PolicyGradientUtils:
         gamma_powers = gamma ** torch.arange(T, dtype=torch.float64, device=rewards.device)
         discounted = rewards * gamma_powers
         returns = torch.flip(torch.cumsum(torch.flip(discounted, [0]), 0), [0])
-        return returns.float()  
-    
+        if normalize:
+            returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+        return returns.float()
+
 
     def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
         """Compute the entropy of a probability distribution given logits."""
@@ -183,28 +193,22 @@ class BaselineStrategy:
     def train_step(self, episode_data: EpisodeData):
         """Perform a training step for the baseline strategy."""
         pass
+
 class NoBaseline(BaselineStrategy):
     """No baseline - returns raw discounted returns."""
     
     def __call__(self, episode_data: EpisodeData) -> torch.Tensor:
         rewards = episode_data.get_rewards(return_pt=True).to(self.device)
-        return PolicyGradientUtils.compute_discounted_returns(rewards, self.agent.gamma)
+        return PolicyGradientUtils.compute_discounted_returns(rewards, self.agent.gamma, normalize=False)
 
 
 class EpisodicStandardization(BaselineStrategy):
     """Standardize rewards within each episode."""
 
     def __call__(self, episode_data: EpisodeData, train: bool = True) -> torch.Tensor:
-        rewards = episode_data.get_rewards(return_pt=True).to(self.device)
-        
-        # Standardize rewards
-        mean = rewards.mean()
-        std = rewards.std()
-        
-        if std == 0:
-            return rewards - mean
-            
-        return (rewards - mean) / (std + 1e-8)
+        rewards = torch.FloatTensor(episode_data.get_rewards()).squeeze(-1).to(self.device)
+        returns = PolicyGradientUtils.compute_discounted_returns(rewards, self.agent.gamma)
+        return returns     
 
 
 class RunningStandardization(BaselineStrategy):
@@ -218,7 +222,7 @@ class RunningStandardization(BaselineStrategy):
     
     def __call__(self, episode_data: EpisodeData, train: bool = True) -> torch.Tensor:
         rewards = episode_data.get_rewards(return_pt=True).to(self.device)
-        returns = PolicyGradientUtils.compute_discounted_returns(rewards, self.agent.gamma)
+        returns = PolicyGradientUtils.compute_discounted_returns(rewards, self.agent.gamma,normalize=False)
         
         # Update running statistics
         episode_mean = returns.mean().item()
@@ -290,16 +294,12 @@ class ValueFunctionBaseline(BaselineStrategy):
     def __init__(
         self,
         agent,
-        learning_rate: float = 5e-4, 
+        learning_rate: float = 1e-2, 
         hidden_dims: list = [128, 128],
-        normalize_returns: bool = False, 
-        normalize_advantages: bool = True,
         epsilon: float = 1e-8,
         init_gain: float = 1.0,
         wandb_logging: bool = True,
-        momentum: float = 0.01,  # Momentum for running statistics
-        activation: str = "relu",  # Activation function for the value network
-        max_grad_norm: float = 0.5  # Maximum gradient norm for clipping
+        max_grad_norm: float = 0  
     ):
         super().__init__(agent)
         
@@ -311,8 +311,6 @@ class ValueFunctionBaseline(BaselineStrategy):
                 vf_config = {
                     "vf_learning_rate": learning_rate,
                     "vf_hidden_dims": hidden_dims,
-                    "vf_normalize_returns": normalize_returns,
-                    "vf_normalize_advantages": normalize_advantages,
                     "vf_epsilon": epsilon,
                     "vf_init_gain": init_gain
                 }
@@ -358,19 +356,8 @@ class ValueFunctionBaseline(BaselineStrategy):
         self.optimizer = torch.optim.Adam(self.value_network.parameters(), lr=learning_rate)        
         self.epsilon = epsilon
         self.max_grad_norm = max_grad_norm
-        
-        # Optional normalizers
-        self.rewards_normalizer = (
-            RunningStandardization(agent) if normalize_returns else 
-            lambda episode_data: PolicyGradientUtils.compute_discounted_returns(
-                episode_data.get_rewards(return_pt=True).to(self.device), 
-                agent.gamma
-            )
-        )
-        self.advantages_normalizer = (
-            RunningAdvantageStandardization(epsilon=epsilon) if normalize_advantages else None
-        )
-    
+        self.rewards_normalizer = EpisodicStandardization(agent)
+
     def _init_weights(self, gain: float = 1.0):
         """Initialize network weights orthogonally."""
         for module in self.value_network.modules():
@@ -379,38 +366,28 @@ class ValueFunctionBaseline(BaselineStrategy):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
     
-    def __call__(self, episode_data: EpisodeData, train: bool = True) -> torch.Tensor:
-   
-        # Compute value estimates
-        if train:
-            self.train_step(episode_data)        
+    def __call__(self, episode_data: EpisodeData) -> torch.Tensor:   
         with torch.no_grad():
-            states = episode_data.get_states(return_pt=True).to(self.device)
-            rewards = episode_data.get_rewards(return_pt=True).to(self.device)
+            states = torch.FloatTensor(np.array(episode_data.get_states())).squeeze(-1).to(self.device)
             target_returns = self.rewards_normalizer(episode_data)
-            values = self.value_network(states).squeeze(-1)
-        
-        # Compute advantages
-        advantages = target_returns - values.detach()
-        if self.advantages_normalizer:
-            advantages = self.advantages_normalizer(advantages)
-        
+            values = self.value_network(states)        
+        advantages = target_returns - values.detach()        
+        advantages = advantages - advantages.mean()  
+        advantages = advantages / (advantages.std() + self.epsilon)  
         return advantages
 
     def train_step(self, episode_data: EpisodeData):
         """Perform a training step for the value function baseline."""
         if not isinstance(episode_data, EpisodeData):
             raise ValueError("episode_data must be an instance of EpisodeData")
-        states = episode_data.get_states(return_pt=True).to(self.device)
-        values = self.value_network(states).squeeze(-1)
-        target_returns = self.rewards_normalizer(episode_data)   
-        loss = F.mse_loss(values, target_returns)
+        states = torch.FloatTensor(np.array(episode_data.get_states())).squeeze(-1).to(self.device)
+        values = self.value_network(states).squeeze(-1)  # Ensure values are 1D tensor
+        target_returns = self.rewards_normalizer(episode_data)
+        loss = F.mse_loss(values, target_returns,reduction='mean')  
         self.optimizer.zero_grad()
-        loss.backward()
-        
+        loss.backward()        
         torch.nn.utils.clip_grad_norm_(self.value_network.parameters(), self.max_grad_norm)
-        self.optimizer.step()
-        
+        self.optimizer.step()        
         # Log metrics to wandb if available
         try:
             if wandb.run is not None:
@@ -494,6 +471,7 @@ class SchedulerFactory:
             kwargs = cls.get_default_kwargs(scheduler_type)
 
         scheduler_class = {
+            SchedulerType.NONE: torch.optim.lr_scheduler.LambdaLR,
             SchedulerType.CYCLIC: torch.optim.lr_scheduler.CyclicLR,
             SchedulerType.STEP: torch.optim.lr_scheduler.StepLR,
             SchedulerType.EXPONENTIAL: torch.optim.lr_scheduler.ExponentialLR,
@@ -509,6 +487,7 @@ class SchedulerFactory:
     def get_default_kwargs(scheduler_type: SchedulerType):  
         """Get default keyword arguments for the specified scheduler type."""
         defaults = {
+            SchedulerType.NONE: {"lambda": lambda epoch: 1.0},
             SchedulerType.CYCLIC: {"base_lr": 0.001, "max_lr": 0.01, "step_size_up": 2000, "mode": "triangular"},
             SchedulerType.STEP: {"step_size": 10000, "gamma": 0.1},
             SchedulerType.EXPONENTIAL: {"gamma": 0.99},

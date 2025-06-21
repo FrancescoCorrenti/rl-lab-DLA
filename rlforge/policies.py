@@ -44,33 +44,37 @@ class EpsilonScheduler:
         self.epsilon = self.last_epsilon
 
 class PolicyNetwork(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim=128, temperature=2.0):
+    def __init__(self, input_dim, output_dim, hidden_dim=128, start_temperature=1.0, end_temperature=0.1, decay_rate=0.001, activation='relu'):
         super().__init__()
-        self.temp_scheduler = LinearTemperatureScheduler(initial_temp=temperature)
+        self.temp_scheduler = LinearTemperatureScheduler(
+            initial_temp=start_temperature,
+            min_temp=end_temperature,
+            decay_rate=decay_rate
+        )
         self.network = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
+            ACTIVATION_FUNCTIONS[activation],
             nn.Linear(hidden_dim, output_dim)
         )
 
     def forward(self, x):
         logits = self.network(x)
-        return F.softmax(logits / self.temp_scheduler.get_temperature(), dim=-1)    
+        return logits
 
     def update_temperature(self):
         self.temp_scheduler.step()
 
 class REINFORCEPolicy(PolicyNetwork):
-    def __init__(self, input_dim, output_dim, hidden_dim=128, temperature=1.0):
-        super().__init__(input_dim, output_dim, hidden_dim, temperature)
+    def __init__(self, input_dim, output_dim, hidden_dim=128, temperature=1.0, activation='relu'):
+        super().__init__(input_dim, output_dim, hidden_dim, temperature, activation=activation)
 
     def forward(self, x):
         # Return raw logits (not probabilities)
         return self.network(x)
 
 class DeepPolicy(PolicyNetwork):
-    def __init__(self, input_dim, output_dim, hidden_dims=[256, 128], activation='relu'): # Default hidden_dims updated
-        super().__init__(input_dim, output_dim, hidden_dim=hidden_dims[0])
+    def __init__(self, input_dim, output_dim, hidden_dims=[256, 128], activation='relu'): 
+        super().__init__(input_dim, output_dim, hidden_dim=hidden_dims[0], activation=activation)
         layers = []
         in_dim = input_dim
         for dim in hidden_dims:
@@ -98,9 +102,7 @@ class DeepPolicy(PolicyNetwork):
         if torch.isnan(x).any():
             raise ValueError(f"Input contains NaN values: {x}")
  
-        output = self.network(x) / self.temp_scheduler.get_temperature()
-        if torch.isnan(output).any():
-            raise ValueError(f"Output contains NaN values after forward pass: {output}")
+        output = self.network(x) 
         return output
 
 class ResidualBlock(nn.Module):

@@ -28,6 +28,7 @@ class Agent:
         self.baseline = None
         self.optimizer = None
         self.scheduler = None
+        self._is_solved = False
         if isinstance(baseline_type, BaselineType):
             print(f"Using baseline type: {baseline_type}")
             self.baseline_type = baseline_type
@@ -38,6 +39,10 @@ class Agent:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
 
+    @property
+    def has_solved(self):
+        """Check if the agent has solved the environment."""
+        return self._is_solved
     def _initialize_scheduler(self, scheduler_type: SchedulerType, scheduler_kwargs: dict):
         """Initializes the learning rate scheduler."""
         from rlforge.functional import SchedulerFactory
@@ -93,7 +98,6 @@ class Agent:
 
         if self.policy_network is None or reset_policy_network:
             self.policy_network = self.build_policy_network()
-            self.optimizer = optim.Adam(self.policy_network.parameters(), lr=self.learning_rate)
         if self.baseline is None or reset_baseline_network:
             self.baseline = self.build_baseline()
 

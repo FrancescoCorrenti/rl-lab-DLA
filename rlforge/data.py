@@ -25,53 +25,6 @@ class EpisodeData:
     total_reward: float = 0.0
     episode_length: int = 0
 
-    @staticmethod
-    def from_values(log_probs=None, states=None, actions=None, rewards=None, next_states=None, dones=None):
-        """Create an EpisodeData instance from lists of values."""
-        lists = [states, actions, rewards, next_states, dones, log_probs]
-        lists_names = ['states', 'actions', 'rewards', 'next_states', 'dones', 'log_probs']
-        lengths = {name: len(lst) for name, lst in zip(lists_names, lists) if lst is not None}
-
-        effective_episode_length = 0
-        if lengths:
-            if len(set(lengths.values())) > 1:
-                print("Warning: Input lists have different lengths: ")
-                for name, length in lengths.items():
-                    print(f"  {name}: {length}")
-                min_len = min(lengths.values())
-                states = states[:min_len] if states is not None else None
-                actions = actions[:min_len] if actions is not None else None
-                rewards = rewards[:min_len] if rewards is not None else None
-                next_states = next_states[:min_len] if next_states is not None else None
-                dones = dones[:min_len] if dones is not None else None
-                log_probs = log_probs[:min_len] if log_probs is not None else None
-                effective_episode_length = min_len
-            else:
-                effective_episode_length = list(lengths.values())[0]
-
-        states, actions, rewards, next_states, log_probs, dones = (
-            states if states is not None else [None] * effective_episode_length,
-            actions if actions is not None else [None] * effective_episode_length,
-            rewards if rewards is not None else [None] * effective_episode_length,
-            next_states if next_states is not None else [None] * effective_episode_length,
-            log_probs if log_probs is not None else [None] * effective_episode_length,
-            dones if dones is not None else [False] * effective_episode_length,
-        )
-
-        episode_data = EpisodeData()
-        for i in range(effective_episode_length):
-            step_data = StepData(
-                state=states[i],
-                action=actions[i],
-                reward=rewards[i],
-                next_state=next_states[i],
-                done=dones[i],
-                log_prob=log_probs[i],
-            )
-            episode_data.add_step(step_data)
-
-        return episode_data
-
     def add_step(self, step_data: StepData):
         self.steps.append(step_data)
         self.total_reward += float(step_data.reward)
@@ -109,6 +62,7 @@ class EpisodeData:
 
     def get_log_probs(self, return_pt=False):
         log_probs = [step.log_prob for step in self.steps]
+                
         if return_pt:
             return torch.stack(log_probs)
         return log_probs
@@ -130,3 +84,13 @@ class EpisodeData:
 
     def __repr__(self) -> str:
         return f"EpisodeData(steps={len(self.steps)}, total_reward={self.total_reward})"
+    
+    def summary(self):
+        """Return a summary of the episode data."""
+        return {
+            "total_reward": self.total_reward,
+            "episode_length": self.episode_length,
+            "num_steps": len(self.steps),
+            "average_reward_per_step": self.total_reward / self.episode_length if self.episode_length > 0 else 0.0,
+            "average_log_prob": torch.mean(torch.stack(self.get_log_probs())) if self.get_log_probs() else 0.0,
+        }

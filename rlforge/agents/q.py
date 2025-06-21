@@ -23,10 +23,10 @@ except ImportError:
 class QLearningAgent(Agent):
     """Deep Q-Learning agent."""
 
-    def __init__(self, name, learning_rate=1e-3, gamma=0.99, experiment=None,
+    def __init__(self, name,  gamma=0.99, experiment=None,
                  epsilon_start=1.0, epsilon_end=0.05, epsilon_decay=0.995,
                  buffer_capacity=10000, batch_size=64, target_update=10, debug_timing=False):
-        super().__init__(name=name, learning_rate=learning_rate, gamma=gamma,
+        super().__init__(name=name, gamma=gamma,
                          baseline_type=BaselineType.NONE)
 
         self.batch_size = batch_size
@@ -146,37 +146,36 @@ class QLearningAgent(Agent):
         grad_metrics["grad_norm/avg_per_param"] = total_norm / max(param_count, 1)
         
         wandb.log(grad_metrics)
-
-    def _perform_evaluation(self, wandb_logging, episode, eval_episodes, max_steps):
-        """Perform evaluation and log results."""
+    def _perform_evaluation(self, wandb_logging, episode, eval_episodes, max_steps, pbar=None):
         self.eval()  # Set to evaluation mode
-        if hasattr(self, '_last_eval_output') and self._last_eval_output:
-            print(f"\033[{self._last_eval_output}A", end="")
-            print("\033[J", end="")
-        
-        lines_used = 1
-        print(f"Evaluating at episode {episode+1}...")
-        
+
         avg_reward, avg_length = self.evaluate(episodes=eval_episodes, max_steps=max_steps)
         evaluation_result = {
             'episode': episode + 1,
             'avg_reward': avg_reward,
             'avg_length': avg_length
         }
-        
+
         if wandb_logging:
             wandb.log({
-                "eval_episode": episode + 1,
-                "eval_avg_reward": avg_reward,
-                "eval_avg_length": avg_length
+                "eval/avg_reward": avg_reward,
+                "eval/avg_length": avg_length,
+                "episode": episode + 1
             })
-        
-        print(f"Evaluation results: Avg Reward: {avg_reward:.2f}, Avg Length: {avg_length:.2f}")
-        lines_used += 1
-        
-        self._last_eval_output = lines_used
+
+        # Aggiorna e mantieni il postfix
+        if not hasattr(self, 'eval_postfix'):
+            self.eval_postfix = {}
+        self.eval_postfix.update({
+            "eval_avg_reward": f"{avg_reward:.2f}",
+            "eval_avg_length": f"{avg_length:.1f}"
+        })
+        if pbar is not None:
+            pbar.set_postfix(self.eval_postfix)
+
         self.train()
         return evaluation_result
+
 
     def _generate_model_description(self, episodes, max_steps, buffer_capacity, batch_size):
         """Generate a pretty description of the model and training configuration."""
@@ -271,17 +270,51 @@ class QLearningAgent(Agent):
 
     def _maybe_evaluate(self, wandb_logging, episode, eval_every, eval_episodes, max_steps,
                         best_eval_reward, episodes_without_improvement, reload_best_after_episodes,
-                        save_best_model_path):
+                        save_best_model_path, early_stop=False, early_stop_path=None, pbar=None):
         evaluation_result = None
+        is_solved = False
         if eval_every > 0 and (episode + 1) % eval_every == 0:
-            eval_result = self._perform_evaluation(wandb_logging, episode, eval_episodes, max_steps)
+            eval_result = self._perform_evaluation(wandb_logging, episode, eval_episodes, max_steps, pbar=pbar)
             evaluation_result = eval_result
+            
+            # Check if environment is solved and handle early stopping
+            if early_stop:
+                is_solved, confirmed_reward = self._check_if_solved(
+                    eval_result['avg_reward'], 
+                    max_steps=max_steps
+                )
+                self._is_solved = is_solved
+
+                if is_solved:
+                    # Save the solved model
+
+                    save_path = early_stop_path or save_best_model_path or f"solved_model_ep{episode+1}.pt"
+                    dirname = os.path.dirname(save_path)
+                    if dirname:
+                        os.makedirs(dirname, exist_ok=True)
+                    torch.save(self.policy_network.state_dict(), save_path)
+                    tqdm.write(f"Solved model saved to {save_path} with confirmed avg reward: {confirmed_reward:.2f}")
+                    
+                    if wandb_logging:
+                        wandb.log({
+                            "environment_solved": True,
+                            "solved_episode": episode + 1,
+                            "solved_reward": confirmed_reward
+                        })
+
+            
             if save_best_model_path and eval_result['avg_reward'] > best_eval_reward:
+                old_best_reward = best_eval_reward
                 best_eval_reward = eval_result['avg_reward']
                 episodes_without_improvement = 0
-                os.makedirs(os.path.dirname(save_best_model_path), exist_ok=True)
+
+                tqdm.write(f"\n🏆 New best model! Reward improved from {old_best_reward:.2f} to {best_eval_reward:.2f}")
+
+                dirname = os.path.dirname(save_best_model_path)
+                if dirname:  
+                    os.makedirs(dirname, exist_ok=True)
                 torch.save(self.policy_network.state_dict(), save_best_model_path)
-                tqdm.write(f"New best model saved to {save_best_model_path} with avg reward: {best_eval_reward:.2f}")
+                tqdm.write(f"🔄 Saved best model to {save_best_model_path}")
             else:
                 episodes_without_improvement += 1
                 if (reload_best_after_episodes > 0 and
@@ -300,13 +333,51 @@ class QLearningAgent(Agent):
             if self.debug_timing and self.timer:
                 self.timer.print_summary()
                 self.experiment.print_timing_summary()
-        return evaluation_result, best_eval_reward, episodes_without_improvement
+        return evaluation_result, best_eval_reward, episodes_without_improvement, is_solved
+
+    def _check_if_solved(self, avg_reward, confirm_episodes=100, max_steps=None):
+        """
+        Check if the environment is considered solved based on the average reward.
+        
+        Args:
+            avg_reward (float): The average reward from evaluation.
+            solve_threshold (float): Threshold for considering the environment solved.
+            confirm_episodes (int): Number of episodes to run for confirmation.
+            max_steps (int, optional): Maximum steps per episode for evaluation.
+            
+        Returns:
+            bool: True if the environment is solved, False otherwise.
+            float: The confirmed average reward if solved, None otherwise.
+        """
+        solve_threshold = self.experiment.reward_threshold
+        if avg_reward < solve_threshold:
+            return False, None
+            
+        print(f"\n🎉 Potential solution detected! Average reward: {avg_reward:.2f}")
+        print(f"Confirming solution with {confirm_episodes} additional episodes...")
+        
+        # Run additional episodes to confirm the solution
+        self.eval()
+        confirmed_avg_reward, confirmed_avg_length = self.evaluate(
+            episodes=confirm_episodes, 
+            max_steps=max_steps
+        )
+        self.train()
+        
+        if confirmed_avg_reward >= solve_threshold:
+            print(f"\n🏆 Environment SOLVED! Confirmed average reward: {confirmed_avg_reward:.2f}")
+            return True, confirmed_avg_reward
+        else:
+            print(f"\n⚠️ Solution not confirmed. Average reward over {confirm_episodes} episodes: {confirmed_avg_reward:.2f}")
+            return False, None
+
     def train_online(self, episodes=500, max_steps=200, render_every=-1, eval_every=100,
                     eval_episodes=10, wandb_logging=False, wandb_project="dqn-training",
                     wandb_run=None, wandb_config=None, debug_timing=None,
                     save_best_model_path: Optional[str] = None, reload_best_after_episodes=-1,
                     log_gradients=True, log_gradients_every=10, flush_experiment_every=-1,
-                    max_grad_norm=1, scheduler_type: SchedulerType = SchedulerType.STEP):
+                    max_grad_norm=1, scheduler_type: SchedulerType = SchedulerType.STEP,
+                    learning_rate=1e-3, early_stop=False, early_stop_path=None):
         """Train the agent using Deep Q-Learning.
         
         Args:
@@ -329,7 +400,11 @@ class QLearningAgent(Agent):
             max_grad_norm (float): Maximum gradient norm for clipping.
             scheduler_type (SchedulerType): Type of LR scheduler.
             scheduler_kwargs (dict, optional): Arguments for the scheduler.
+            early_stop (bool): Stop training if environment is solved (avg reward > 200).
+            early_stop_path (str): Path to save the solved model. If None, uses save_best_model_path.
         """
+        self.learning_rate = learning_rate
+        self.optimizer = torch.optim.Adam(self.policy_network.parameters(), lr=self.learning_rate)
         if self._is_eval:
             self.train()
         if self.experiment is None:
@@ -337,7 +412,7 @@ class QLearningAgent(Agent):
 
         if debug_timing is not None:
             self.debug_timing = debug_timing
-            self.timer = PolicyGradientUtils.DebugTimer() if debug_timing else None
+            self.timer = DebugTimer() if debug_timing else None
 
         self.policy_network.train()
         print(self._generate_model_description(episodes, max_steps, self.buffer.capacity, self.batch_size))
@@ -355,7 +430,7 @@ class QLearningAgent(Agent):
         best_eval_reward = getattr(self, 'evaluation_best', float('-inf'))
         episodes_without_improvement = 0
         evaluation_results = []
-        pbar = tqdm(range(episodes), desc="Training", unit="episode")
+        pbar = tqdm(range(episodes), desc=f"Training {self.name}")
 
         for episode in pbar:
             episode_start = time.perf_counter()
@@ -375,22 +450,26 @@ class QLearningAgent(Agent):
 
             self._log_metrics(wandb_logging, episode, episode_data, losses)
 
-            episode_time = time.perf_counter() - episode_start
-            avg_loss = sum(losses) / len(losses) if losses else 0
-            desc = (f"Episode {episode+1} | Reward: {episode_data.total_reward:.2f} | "
-                   f"Loss: {avg_loss:.4f} | ε: {self.epsilon_scheduler.get_epsilon():.3f}")
-            if self.debug_timing:
-                desc += f" | Time: {episode_time*1000:.1f}ms"
-            if reload_best_after_episodes > 0 and save_best_model_path:
-                desc += f" | No improve: {episodes_without_improvement}/{reload_best_after_episodes}"
-            pbar.set_description(desc)
-
-            eval_result, best_eval_reward, episodes_without_improvement = self._maybe_evaluate(
+            eval_result, best_eval_reward, episodes_without_improvement, is_solved = self._maybe_evaluate(
                 wandb_logging, episode, eval_every, eval_episodes, max_steps,
                 best_eval_reward, episodes_without_improvement,
-                reload_best_after_episodes, save_best_model_path)
+                reload_best_after_episodes, save_best_model_path, early_stop, early_stop_path, pbar=pbar)
+            
             if eval_result:
                 evaluation_results.append(eval_result)
+                
+            # If environment is solved and early stopping is enabled, break the training loop
+            if early_stop and is_solved:
+                tqdm.write(f"\n🚀 Training stopped early at episode {episode+1} as environment is considered solved!")
+                break
+
+            avg_loss = sum(losses) / len(losses) if losses else 0
+            pbar.set_postfix({
+                "reward": f"{episode_data.total_reward:.2f}",
+                "length": len(episode_data),
+                "loss": f"{avg_loss:.4f}",
+                "epsilon": f"{self.epsilon_scheduler.get_epsilon():.3f}"
+            })
 
         pbar.close()
 

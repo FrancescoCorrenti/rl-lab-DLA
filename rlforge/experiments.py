@@ -18,7 +18,7 @@ from .memory import Memory, MemoryManager
 
 
 class Experiment:
-    def __init__(self, env, env_renderer, name=None, description=None, debug_timing=False):
+    def __init__(self, env, env_renderer, name=None, description=None, debug_timing=False, solve_threshold=200):
         self.env = env
         self.env_renderer = env_renderer
         self.name = name
@@ -27,8 +27,9 @@ class Experiment:
         self.debug_timing = debug_timing
         self.timer = None
         if debug_timing:
-            from .functional import PolicyGradientUtils
-            self.timer = PolicyGradientUtils.DebugTimer()
+            from .functional import DebugTimer
+            self.timer = DebugTimer()
+        self._reward_threshold = solve_threshold
     
     @property
     def memory(self):
@@ -49,7 +50,7 @@ class Experiment:
         """Add a new named memory."""
         return self.memory_manager.add_memory(name)
 
-    def run_episode(self, agent: 'Agent', max_steps=200, render=False, memory_name=None, debug_timing=None, store_in_memory=True):
+    def run_episode(self, agent: 'Agent', max_steps=200, render=False, memory_name=None, debug_timing=None, store_in_memory=False):
         """
         Run a single episode of the experiment.
         """
@@ -57,9 +58,9 @@ class Experiment:
         if debug_timing is not None:
             self.debug_timing = debug_timing
             if debug_timing and self.timer is None:
-                from .functional import PolicyGradientUtils
-                self.timer = PolicyGradientUtils.DebugTimer()
-        
+                from .functional import DebugTimer
+                self.timer = DebugTimer()
+
         if agent.experiment is not self:
             raise ValueError(f"Agent's experiment does not match this Experiment instance. Please set the agent's experiment using agent.set_experiment(self).")
         
@@ -72,16 +73,15 @@ class Experiment:
         done = False
         memory = self.memory_manager.get_memory(memory_name)
         episode_data = EpisodeData()
-
+        
         for step in range(max_steps):
             with self.timer.time_block("action_selection") if self.timer else nullcontext():
                 action_result = agent.select_action(state)
                 action, log_prob, logits = action_result
              
             with self.timer.time_block("env_step") if self.timer else nullcontext():
-                next_state, reward, done, truncated, _ = env_to_use.step(action)
+                next_state, reward, done, truncated, _ = env_to_use.step(action.item() if isinstance(action, torch.Tensor) else action)
                 done = done or truncated
-
             with self.timer.time_block("data_collection") if self.timer else nullcontext():
                 step_data = StepData(state, action, reward, next_state, done, log_prob, logits)
                 episode_data.add_step(step_data)
@@ -221,3 +221,11 @@ class Experiment:
             memory.clear()
         else:
             raise ValueError(f"Memory '{memory_name}' does not exist.")
+        
+    @property
+    def reward_threshold(self):
+        """
+        Get the reward threshold for solving the environment.
+        This can be used to determine if the environment is solved.
+        """
+        return self._reward_threshold
