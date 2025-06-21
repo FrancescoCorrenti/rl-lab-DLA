@@ -259,9 +259,7 @@ This graph shows the learning curves of the DQN agent vs the best REINFORCE agen
   <img src="/images/cartpole_comp_dqn.png" width="600" alt="CartPole-v1 DQN Learning Curves">
 </div>
 <div align="center">
-  <video width="640" height="360" controls>
-    <source src="videos/cartpole_dqn_video.mp4/rl-video-episode-0.mp4" type="video/mp4">
-  </video>
+  <img width="550" src="images/cartpole.gif">    
 </div>
 
 ### Results on LunarLander-v3: Q-Learning
@@ -284,10 +282,9 @@ This graph shows the learning curves of the DQN agent vs the best REINFORCE agen
   <img src="/images/lunar_comp_dqn.png" width="600" alt="LunarLander-v3 DQN Learning Curves">
 </div>
 <div align="center">
-  <video width="640" height="360" controls>
-    <source src="videos/lunar_lander_q/rl-video-episode-0.mp4" type="video/mp4">
-  </video>
+  <img width="550" src="images/lunar.gif">    
 </div>
+
 
 
 ---
